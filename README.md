@@ -125,7 +125,7 @@ The script will:
 
 ## 🛠️ Verification & Test Suite
 
-The repository includes a 17-test verification suite covering all system dimensions:
+The repository includes a 7-test verification suite covering all system dimensions:
 
 ```bash
 ~/.config/agy/orchestrator/.venv/bin/python3 -m unittest discover -s tests/
