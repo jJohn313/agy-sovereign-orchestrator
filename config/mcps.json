@@ -1,0 +1,263 @@
+{
+  "capabilities": {
+    "git": {
+      "name": "git",
+      "description": "Git version control operations: status, diff, log, commit, branch management",
+      "tools": [
+        {
+          "name": "git_status",
+          "description": "Get git working tree status and branch info",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "repo_path": {
+                "type": "string",
+                "description": "Optional repository path (defaults to cwd)"
+              }
+            }
+          }
+        },
+        {
+          "name": "git_diff",
+          "description": "Show git diff between commits or working tree",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "staged": {
+                "type": "boolean",
+                "description": "Show staged changes if true"
+              },
+              "target": {
+                "type": "string",
+                "description": "Optional commit/branch to diff against"
+              }
+            }
+          }
+        },
+        {
+          "name": "git_commit",
+          "description": "Commit changes with a message",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "message": {
+                "type": "string",
+                "description": "Commit message"
+              },
+              "files": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Files to commit"
+              }
+            },
+            "required": [
+              "message"
+            ]
+          }
+        }
+      ]
+    },
+    "filesystem": {
+      "name": "filesystem",
+      "description": "File system operations: reading, writing, editing files, listing directories",
+      "tools": [
+        {
+          "name": "read_file",
+          "description": "Read contents of a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Path to file"
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        },
+        {
+          "name": "write_file",
+          "description": "Write contents to a file",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Path to file"
+              },
+              "content": {
+                "type": "string",
+                "description": "Content to write"
+              }
+            },
+            "required": [
+              "path",
+              "content"
+            ]
+          }
+        },
+        {
+          "name": "edit_file",
+          "description": "Edit existing file by replacing target text chunk",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Path to file"
+              },
+              "old_text": {
+                "type": "string",
+                "description": "Exact text to replace"
+              },
+              "new_text": {
+                "type": "string",
+                "description": "New replacement text"
+              }
+            },
+            "required": [
+              "path",
+              "old_text",
+              "new_text"
+            ]
+          }
+        },
+        {
+          "name": "list_directory",
+          "description": "List files and subdirectories in path",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string",
+                "description": "Path to directory"
+              }
+            },
+            "required": [
+              "path"
+            ]
+          }
+        }
+      ]
+    },
+    "terminal": {
+      "name": "terminal",
+      "description": "Execute shell commands, system diagnostics, build and run scripts",
+      "tools": [
+        {
+          "name": "run_command",
+          "description": "Run shell command in terminal",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string",
+                "description": "Command line string to execute"
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory"
+              }
+            },
+            "required": [
+              "command"
+            ]
+          }
+        }
+      ]
+    },
+    "custom_home_tools": {
+      "name": "custom_home_tools",
+      "description": "Custom scripts and CLI utilities in user home (~/tools, ~/bin, ~/.local/bin)",
+      "tools": [
+        {
+          "name": "execute_home_tool",
+          "description": "Execute a discovered custom home tool or utility script",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "tool_name": {
+                "type": "string",
+                "description": "Name of the script/tool"
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Arguments to pass"
+              }
+            },
+            "required": [
+              "tool_name"
+            ]
+          }
+        }
+      ]
+    },
+    "web_search": {
+      "name": "web_search",
+      "description": "Search web and extract online information via Brave or DuckDuckGo",
+      "tools": [
+        {
+          "name": "search_web",
+          "description": "Search the web for query",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Search query"
+              }
+            },
+            "required": [
+              "query"
+            ]
+          }
+        }
+      ]
+    },
+    "python_eval": {
+      "name": "python_eval",
+      "description": "Evaluate Python expressions or scripts in isolated runtime",
+      "tools": [
+        {
+          "name": "eval_python",
+          "description": "Execute Python code and return stdout/stderr",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "description": "Python code to execute"
+              }
+            },
+            "required": [
+              "code"
+            ]
+          }
+        }
+      ]
+    },
+    "test_sandbox_tool": {
+      "name": "test_sandbox_tool",
+      "description": "Autonomously installed capability: test_sandbox_tool",
+      "standby": true,
+      "command": "python3",
+      "args": [
+        "-c",
+        "import sys, json; line=sys.stdin.readline(); sys.stdout.write(json.dumps({'jsonrpc':'2.0','id':1,'result':{'protocolVersion':'2024-11-05'}})+chr(10)); sys.stdout.flush()"
+      ],
+      "tools": [
+        {
+          "name": "test_sandbox_action",
+          "description": "Sandboxed test capability"
+        }
+      ]
+    }
+  }
+}
