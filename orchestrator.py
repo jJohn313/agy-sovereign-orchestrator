@@ -22,7 +22,7 @@ from jev_client import JevClient
 from retrieval import TargetedVectorRetriever
 from meta_tools import LocalToolRegistry, PONYTAIL_SCHEMA
 from post_turn_hook import PostTurnHook
-from sanitizer import fold_log_output
+from sanitizer import fold_log_output, strip_ansi, find_first_anchor
 
 logger = logging.getLogger("agy.orchestrator")
 
@@ -343,6 +343,85 @@ class AgyOrchestrator:
         raw_result = json.dumps({"status": "executed", "tool": call.name, "args": call.arguments})
         return fold_log_output(raw_result, exit_code=0)
 
+    def fold_historical_tool_output(self, tool_name: str, raw_content: str, max_chars: int = 250) -> str:
+        """
+        Folds historical tool content into a compact summary stub.
+        Output format: {"tool": "<name>", "status": "ok"|"err", "summary": "<summary>"}
+        """
+        clean_text = strip_ansi(raw_content).strip()
+        status = "ok"
+        summary = ""
+
+        # 1. Try parsing structured JSON tool response
+        try:
+            data = json.loads(clean_text)
+            if isinstance(data, dict):
+                if data.get("status") in ("error", "err", "failed") or "error" in data or data.get("exit_code", 0) != 0:
+                    status = "err"
+                    summary = str(data.get("error") or data.get("message") or clean_text)
+                else:
+                    status = "ok"
+                    summary = str(data.get("summary") or data.get("message") or clean_text)
+        except Exception:
+            pass
+
+        # 2. Check for text error anchors (Traceback, Error:, FAILED, fatal:)
+        if status != "err":
+            lines = clean_text.splitlines()
+            anchor_idx = find_first_anchor(lines)
+            if anchor_idx is not None:
+                status = "err"
+                # Extract primary failure line
+                summary = lines[anchor_idx].strip()
+            else:
+                # Clean success: take first meaningful line
+                non_empty = [l.strip() for l in lines if l.strip()]
+                summary = non_empty[0] if non_empty else "Success"
+
+        # Enforce character cap
+        if len(summary) > max_chars:
+            summary = summary[: max_chars - 3].rstrip() + "..."
+
+        return json.dumps({
+            "tool": tool_name,
+            "status": status,
+            "summary": summary,
+        })
+
+    def serialize_messages_for_frontier(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Non-destructively serializes messages for the API payload.
+        Compresses older tool responses (T <= -2) into summary stubs, while leaving
+        the immediate previous turn (T - 1) full fidelity.
+        """
+        import copy
+        outbound = copy.deepcopy(messages)
+
+        # 1. Scan backwards to find the block of immediate previous tool responses (T-1)
+        t_minus_1_indices = []
+        in_t_minus_1_block = False
+
+        for i in range(len(outbound) - 1, -1, -1):
+            msg = outbound[i]
+            role = msg.get("role")
+            if role == "tool":
+                in_t_minus_1_block = True
+                t_minus_1_indices.append(i)
+            elif in_t_minus_1_block:
+                # We've moved past the contiguous block of T-1 tool responses
+                break
+
+        # 2. Compress all tool responses prior to T-1
+        for i in range(len(outbound)):
+            msg = outbound[i]
+            if msg.get("role") == "tool" and i not in t_minus_1_indices:
+                tool_name = msg.get("name", "unknown_tool")
+                raw_content = msg.get("content", "")
+                folded = self.fold_historical_tool_output(tool_name, raw_content)
+                msg["content"] = folded
+
+        return outbound
+
     def run_agent_loop(
         self,
         prompt: str,
@@ -373,8 +452,10 @@ class AgyOrchestrator:
         escalation_count = 0
 
         while True:
+            outbound_messages = self.serialize_messages_for_frontier(messages)
+
             response = call_frontier_model(
-                messages=messages,
+                messages=outbound_messages,
                 tools=active_tools,
                 context=context,
             )
