@@ -224,5 +224,52 @@ class TestOrchestratorEscalationLoop(unittest.TestCase):
         self.assertIn("test_exec", active_names)
 
 
+
+class TestPromptPrefixStabilizer(unittest.TestCase):
+    def test_cache_hash_stability(self):
+        from orchestrator import PromptPrefixStabilizer
+        system_directive = "Test System Directive"
+        invariant_tools = [{"name": "ponytail", "desc": "test"}, {"name": "enable_capability", "desc": "test2"}]
+        dynamic_active_tools = [{"name": "b_tool", "desc": "b"}, {"name": "a_tool", "desc": "a"}]
+        l4a_static_invariants = {
+            "repositories": ["/a/b", "/c/d"],
+            "custom_home_scripts": [
+                {"name": "test.sh", "path": "/home/user/bin/test.sh"},
+            ],
+            "mtime": 1234567,
+            "pid": 999
+        }
+
+        # Turn 1
+        l4b_turn1 = {"is_git": True, "branch": "main", "dirty_files": ["foo.py"]}
+        res1 = PromptPrefixStabilizer.assemble_prompt_layers(
+            system_directive=system_directive,
+            invariant_tools=invariant_tools,
+            dynamic_active_tools=dynamic_active_tools,
+            l4a_static_invariants=l4a_static_invariants,
+            l4b_volatile_state=l4b_turn1,
+            dynamic_turn_payload="Do something",
+        )
+
+        # Turn 2: Mutated L4b, same L4a
+        l4b_turn2 = {"is_git": True, "branch": "main", "dirty_files": ["foo.py", "bar.py"]}
+        # Also mutate some stripped fields in L4a
+        l4a_static_invariants["mtime"] = 7654321
+        l4a_static_invariants["pid"] = 888
+
+        res2 = PromptPrefixStabilizer.assemble_prompt_layers(
+            system_directive=system_directive,
+            invariant_tools=invariant_tools,
+            dynamic_active_tools=dynamic_active_tools,
+            l4a_static_invariants=l4a_static_invariants,
+            l4b_volatile_state=l4b_turn2,
+            dynamic_turn_payload="Do something else",
+        )
+
+        self.assertEqual(res1["prefix_cache_hash"], res2["prefix_cache_hash"])
+        self.assertIn("bar.py", res2["turn_payload"])
+        self.assertNotIn("bar.py", res1["turn_payload"])
+
+
 if __name__ == "__main__":
     unittest.main()
