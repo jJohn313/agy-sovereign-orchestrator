@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional, Set, Tuple
 
 from mcp_installer import AutonomousMcpInstaller
+from schema_minifier import minify_tool_schema
 
 logger = logging.getLogger("agy.meta_tools")
 
@@ -75,6 +76,8 @@ class LocalToolRegistry:
                     data = json.load(f)
                     caps = data.get("capabilities", {})
                     for name, meta in caps.items():
+                        if "tools" in meta:
+                            meta["tools"] = [minify_tool_schema(t) for t in meta["tools"]]
                         self.capabilities[name] = meta
             except Exception as e:
                 logger.error("Failed to read %s: %s", self.config_path, e)
@@ -93,7 +96,7 @@ class LocalToolRegistry:
                                         with open(sf.path, "r", encoding="utf-8") as f:
                                             s_data = json.load(f)
                                             if "name" in s_data:
-                                                tools.append(s_data)
+                                                tools.append(minify_tool_schema(s_data))
                                     except Exception:
                                         pass
                             self.capabilities[server_name] = {

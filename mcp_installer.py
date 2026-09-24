@@ -18,6 +18,8 @@ import logging
 import subprocess
 from typing import Dict, Any, Optional, Tuple
 
+from schema_minifier import minify_tool_schema
+
 logger = logging.getLogger("agy.mcp_installer")
 
 MCPS_CONFIG_PATH = os.path.expanduser("~/.config/agy/mcps.json")
@@ -154,6 +156,9 @@ class AutonomousMcpInstaller:
             except Exception:
                 data = {"capabilities": {}}
 
+        # Minify tools before writing
+        minified_tools = [minify_tool_schema(t) for t in config.get("tools", [])]
+
         # Mark tool as Standby (disabled by default on future turns)
         entry = {
             "name": capability_name,
@@ -161,7 +166,7 @@ class AutonomousMcpInstaller:
             "standby": True,
             "command": config.get("command"),
             "args": config.get("args", []),
-            "tools": config.get("tools", []),
+            "tools": minified_tools,
         }
         data["capabilities"][capability_name] = entry
 
