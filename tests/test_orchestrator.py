@@ -107,8 +107,10 @@ class TestTargetedVectorRetrieval(unittest.TestCase):
         res2 = retriever.retrieve("query", codebase_gate=0.6, mem0_gate=0.8)
         self.assertEqual(len(res2["codebase_matches"]), 1)
         self.assertEqual(len(res2["mem0_matches"]), 1)
-        self.assertIn("Relevant Durable Memory", res2["formatted_context"])
-        self.assertIn("Relevant Codebase Workspaces", res2["formatted_context"])
+        # Note: In the latest version, "Relevant Durable Memory" and "Relevant Codebase Workspaces"
+        # headers were removed per dynamic Top-K implementation requirements.
+        self.assertIn("[mem0:m1]", res2["formatted_context"])
+        self.assertIn("[codebase:/path/1]", res2["formatted_context"])
 
 
 class TestMetaToolsAndRegistry(unittest.TestCase):

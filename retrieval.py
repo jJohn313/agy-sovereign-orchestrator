@@ -19,6 +19,18 @@ EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
 _embedder = None
 
+
+def compute_jaccard_similarity(text_a: str, text_b: str) -> float:
+    """Computes word-level Jaccard similarity between two strings."""
+    tokens_a = set(re.findall(r"\w+", text_a.lower()))
+    tokens_b = set(re.findall(r"\w+", text_b.lower()))
+    if not tokens_a or not tokens_b:
+        return 0.0
+    intersection = len(tokens_a & tokens_b)
+    union = len(tokens_a | tokens_b)
+    return intersection / union if union > 0 else 0.0
+
+
 # Regex fallback pattern for broken code or non-Python code
 STRUCTURAL_REGEX = re.compile(
     r"^(?:[ \t]*)(?:async\s+def\s+[a-zA-Z0-9_]+|def\s+[a-zA-Z0-9_]+|class\s+[a-zA-Z0-9_]+|export\s+(?:default\s+)?(?:function|class|const|let|var)\s+[a-zA-Z0-9_]+|function\s+[a-zA-Z0-9_]+)",
@@ -304,6 +316,7 @@ class TargetedVectorRetriever:
         Phase 2: Targeted Vector Retrieval.
         - If Codebase Gate > 0.5: Query Codebase index, filter >= 0.75.
         - If Mem0 Gate > 0.5: Query Mem0 vector DB, filter >= 0.75.
+        - Applies dynamic Top-K capping (max_k=4) and MMR Jaccard deduplication.
         """
         context: Dict[str, Any] = {
             "codebase_matches": [],
@@ -311,25 +324,96 @@ class TargetedVectorRetriever:
             "formatted_context": "",
         }
 
+        candidates = []
+
         if codebase_gate > 0.5:
             matches = self.codebase_retriever.search(user_prompt)
             context["codebase_matches"] = matches
+            for m in matches:
+                candidates.append({
+                    "source": "codebase",
+                    "score": m["similarity"],
+                    "path": m["path"],
+                    "name": m["name"],
+                    "text": m.get("summary") or m.get("name") or "",
+                    "raw": m
+                })
 
         if mem0_gate > 0.5:
             matches = self.mem0_retriever.search(user_prompt)
             context["mem0_matches"] = matches
+            for m in matches:
+                candidates.append({
+                    "source": "mem0",
+                    "score": m["score"],
+                    "id": m.get("id"),
+                    "text": m.get("memory") or "",
+                    "raw": m
+                })
 
+        if not candidates:
+            return context
+
+        # Sort combined candidates descending by score
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        accepted = []
+        max_k = 4
+
+        for cand in candidates:
+            if len(accepted) >= max_k:
+                break
+
+            # Check Jaccard similarity against already accepted candidates
+            is_redundant = False
+            for acc in accepted:
+                if compute_jaccard_similarity(cand["text"], acc["text"]) > 0.60:
+                    is_redundant = True
+                    break
+
+            if not is_redundant:
+                accepted.append(cand)
+
+        if not accepted:
+            return context
+
+        # Format surviving chunks
         lines = []
-        if context["mem0_matches"]:
-            lines.append("### Relevant Durable Memory (Similarity >= 0.75):")
-            for m in context["mem0_matches"]:
-                lines.append(f"- [{m['score']:.2f}] {m['memory']}")
+        for item in accepted:
+            if item["source"] == "codebase":
+                path = item["path"]
 
-        if context["codebase_matches"]:
-            lines.append("### Relevant Codebase Workspaces (Similarity >= 0.75):")
-            for c in context["codebase_matches"]:
-                summary_snippet = (c.get("summary") or "").strip().split("\n")[0]
-                lines.append(f"- [{c['similarity']:.2f}] {c['name']} ({c['path']}): {summary_snippet}")
+                raw = item.get("raw", {})
+                start_line = raw.get("start_line")
+                end_line = raw.get("end_line")
+                if start_line is not None and end_line is not None:
+                    tag = f"[codebase:{path}:{start_line}-{end_line}]"
+                else:
+                    tag = f"[codebase:{path}]"
+
+                # Assuming summary contains the content. Extract just the first line for snippet.
+                summary_snippet = item["text"].strip().split("\n")[0]
+                lines.append(f"- {tag} ({item['score']:.2f}) {summary_snippet}")
+            elif item["source"] == "mem0":
+                mem_id = item.get("id")
+                tag_id = mem_id if mem_id is not None else "rule"
+                tag = f"[mem0:{tag_id}]"
+                lines.append(f"- {tag} ({item['score']:.2f}) {item['text']}")
 
         context["formatted_context"] = "\n".join(lines)
+
+        # We should also filter the returned codebase_matches and mem0_matches?
+        # The prompt says: "Return {'codebase_matches': [], 'mem0_matches': [], 'formatted_context': ''} if no candidates"
+        # Since we modified the raw matches arrays, maybe we shouldn't prune them, just `formatted_context` matters for Layer 5.
+        # Wait, the objective says "Implement a hard cap of max_k = 4 on final retrieved chunks."
+        # If Layer 5 only uses `formatted_context`, keeping matches as-is is fine, but to be safe we can filter them.
+
+        # Actually I will just return the full matches arrays since the prompt only focuses on the formatted_context string and deduplication.
+        # Let's filter the actual returned matches to only include the accepted ones, it's safer.
+        final_codebase = [item["raw"] for item in accepted if item["source"] == "codebase"]
+        final_mem0 = [item["raw"] for item in accepted if item["source"] == "mem0"]
+
+        context["codebase_matches"] = final_codebase
+        context["mem0_matches"] = final_mem0
+
         return context
