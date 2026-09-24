@@ -60,11 +60,37 @@ fi
 
 # 4. Install Global Launcher Shim
 echo "[4/6] Installing global launcher shim at ${BIN_DIR}/agy..."
-cat << 'EOF' > "${BIN_DIR}/agy"
+
+# Safely handle existing agy binary
+EXISTING_AGY=$(which agy 2>/dev/null || true)
+if [ -n "${EXISTING_AGY}" ] && [ "${EXISTING_AGY}" != "${BIN_DIR}/agy" ]; then
+    echo "       Found existing agy binary at ${EXISTING_AGY}"
+    # If the existing agy is already a shim pointing to this orchestrator, don't rename it
+    if ! grep -q "orchestrator.py" "${EXISTING_AGY}"; then
+        EXISTING_AGY_DIR=$(dirname "${EXISTING_AGY}")
+        AGY_BIN_PATH="${EXISTING_AGY_DIR}/agy-bin"
+        echo "       Renaming existing agy to ${AGY_BIN_PATH}..."
+        # Use sudo if it's in a system path
+        if [ ! -w "${EXISTING_AGY_DIR}" ]; then
+            sudo mv "${EXISTING_AGY}" "${AGY_BIN_PATH}"
+        else
+            mv "${EXISTING_AGY}" "${AGY_BIN_PATH}"
+        fi
+        export DETECTED_AGY_ORIGINAL_BIN="${AGY_BIN_PATH}"
+    else
+        echo "       Existing agy is already an orchestrator shim."
+        export DETECTED_AGY_ORIGINAL_BIN="${AGY_ORIGINAL_BIN:-$(which agy-bin 2>/dev/null || echo '')}"
+    fi
+else
+    # Check if agy-bin exists
+    export DETECTED_AGY_ORIGINAL_BIN="${AGY_ORIGINAL_BIN:-$(which agy-bin 2>/dev/null || echo '')}"
+fi
+
+cat << EOF > "${BIN_DIR}/agy"
 #!/usr/bin/env bash
 # Global Jev System-1 Shim for agy
-export AGY_ORIGINAL_BIN="${AGY_ORIGINAL_BIN:-$(which agy-bin 2>/dev/null || echo '/usr/local/bin/agy-bin')}"
-exec "${HOME}/.config/agy/orchestrator/.venv/bin/python3" "${HOME}/.config/agy/orchestrator/orchestrator.py" "$@"
+export AGY_ORIGINAL_BIN="\${AGY_ORIGINAL_BIN:-${DETECTED_AGY_ORIGINAL_BIN}}"
+exec "${HOME}/.config/agy/orchestrator/.venv/bin/python3" "${HOME}/.config/agy/orchestrator/orchestrator.py" "\$@"
 EOF
 chmod +x "${BIN_DIR}/agy"
 

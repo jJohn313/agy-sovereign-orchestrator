@@ -426,16 +426,33 @@ class AgyOrchestrator:
 def main():
     """Mode-Aware TTY & Execution Runner (Fix 4)."""
     args = sys.argv[1:]
-    manager_path = "/home/john/.gemini/antigravity-cli/bin/agy_manager.py"
-    orig_bin = os.getenv("AGY_ORIGINAL_BIN", "/home/john/.local/bin/agy-bin")
+
+    # Use dynamic paths instead of hardcoded home paths
+    home_dir = os.path.expanduser("~")
+    manager_path = os.path.join(home_dir, ".gemini", "antigravity-cli", "bin", "agy_manager.py")
+    orig_bin_fallback = os.path.join(home_dir, ".local", "bin", "agy-bin")
+    orig_bin = os.getenv("AGY_ORIGINAL_BIN", "")
+
+    # If AGY_ORIGINAL_BIN is empty, try the fallback path
+    if not orig_bin:
+        orig_bin = orig_bin_fallback
 
     is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
 
     if not args:
         if is_interactive and os.path.exists(manager_path):
             os.execv("/usr/bin/python3", ["python3", manager_path, "select"])
-        elif os.path.exists(orig_bin):
+        elif orig_bin and os.path.exists(orig_bin):
             os.execv(orig_bin, [orig_bin])
+        else:
+            # Fallback when no args are provided and the original binary is missing
+            print("\n[Jev System-1 Orchestrator]")
+            print("Usage: agy <prompt> [options]")
+            print("To see full orchestrator output, use: agy --json")
+            print("Note: The original agy binary was not found. Please provide a prompt to run the orchestrator directly.")
+            print("Example: agy \"What does this codebase do?\"")
+            print()
+            sys.exit(0)
         return
 
     subcmd = args[0]

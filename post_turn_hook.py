@@ -8,6 +8,7 @@ Features:
 
 import os
 import time
+import shutil
 import sqlite3
 import subprocess
 import logging
@@ -152,8 +153,11 @@ class PostTurnHook:
                 text=True,
             )
             if status_res.stdout.strip():
-                logger.info("Git modifications detected in %s; triggering sem-index", toplevel)
-                subprocess.run(["sem-index", toplevel], capture_output=True)
+                if shutil.which("sem-index"):
+                    logger.info("Git modifications detected in %s; triggering sem-index", toplevel)
+                    subprocess.run(["sem-index", toplevel], capture_output=True)
+                else:
+                    logger.warning("Git modifications detected in %s, but 'sem-index' is not installed or not in PATH.", toplevel)
                 return {"mode": "git", "reindexed": True, "path": toplevel}
             return {"mode": "git", "reindexed": False, "path": toplevel}
 
@@ -187,13 +191,18 @@ class PostTurnHook:
         current_time = time.time()
         # If files were modified after last_ts, or first turn in non-git dir
         if max_mtime > last_ts or last_ts == 0.0:
-            logger.info("Non-Git workspace changes detected via mtime in %s; triggering sem-index", target_dir)
             try:
                 with open(LAST_TURN_TS_FILE, "w", encoding="utf-8") as f:
                     f.write(str(current_time))
             except Exception:
                 pass
-            subprocess.run(["sem-index", target_dir], capture_output=True)
+
+            if shutil.which("sem-index"):
+                logger.info("Non-Git workspace changes detected via mtime in %s; triggering sem-index", target_dir)
+                subprocess.run(["sem-index", target_dir], capture_output=True)
+            else:
+                logger.warning("Non-Git workspace changes detected via mtime in %s, but 'sem-index' is not installed or not in PATH.", target_dir)
+
             return {"mode": "non_git_mtime", "reindexed": True, "path": target_dir}
 
         try:
