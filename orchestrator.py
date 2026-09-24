@@ -438,10 +438,11 @@ def main():
         orig_bin = orig_bin_fallback
 
     is_interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    python_bin = sys.executable or "/usr/bin/python3"
 
     if not args:
         if is_interactive and os.path.exists(manager_path):
-            os.execv("/usr/bin/python3", ["python3", manager_path, "select"])
+            os.execv(python_bin, [python_bin, manager_path, "select"])
         elif orig_bin and os.path.exists(orig_bin):
             os.execv(orig_bin, [orig_bin])
         else:
@@ -457,7 +458,7 @@ def main():
 
     subcmd = args[0]
     if subcmd in ("select", "-s", "--select", "list", "ls", "--list", "rename", "title", "auto-titles", "titles") and os.path.exists(manager_path):
-        os.execv("/usr/bin/python3", ["python3", manager_path] + args[1:])
+        os.execv(python_bin, [python_bin, manager_path] + args[1:])
         return
 
     if subcmd in ("-n", "--new") and os.path.exists(orig_bin):
