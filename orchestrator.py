@@ -13,7 +13,9 @@ import os
 import sys
 import json
 import logging
-from typing import Dict, Any, List, Optional, Callable, Tuple
+import hashlib
+import subprocess
+from typing import Dict, Any, List, Optional, Callable, Tuple, Union
 
 from daemon import DaemonClient
 from jev_client import JevClient
@@ -137,21 +139,137 @@ class PromptPrefixStabilizer:
     """Enforces deterministic prompt assembly for 75-90% cache locking."""
 
     @staticmethod
-    def assemble_prompt_layers(
+    def canonicalize_for_cache(data: Any) -> Any:
+        """Recursively sort dict keys and primitive lists, stripping non-deterministic fields."""
+        if isinstance(data, dict):
+            return {
+                k: PromptPrefixStabilizer.canonicalize_for_cache(v)
+                for k, v in sorted(data.items(), key=lambda item: item[0])
+                if k not in ("mtime", "timestamp", "last_accessed", "pid")
+            }
+        elif isinstance(data, (list, tuple, set)):
+            # Recursively process items
+            processed = [PromptPrefixStabilizer.canonicalize_for_cache(x) for x in data]
+            # Sort lists of scalar types (e.g. paths, script names)
+            if all(isinstance(x, (str, int, float)) for x in processed):
+                return sorted(processed)
+            return processed
+        return data
+
+    @classmethod
+    def compute_prefix_cache_hash(
+        cls,
         system_directive: str,
         invariant_tools: List[Dict[str, Any]],
         dynamic_active_tools: List[Dict[str, Any]],
-        workspace_anchors_text: str,
-        dynamic_turn_payload: str,
+        l4a_static_invariants: Union[Dict[str, Any], str],
+    ) -> str:
+        """
+        Computes a canonical SHA-256 digest of the static prefix (L1 through L4a).
+        Guarantees prefix cache hit verification across turns.
+        """
+        canonical_l4a = (
+            cls.canonicalize_for_cache(l4a_static_invariants)
+            if isinstance(l4a_static_invariants, dict)
+            else l4a_static_invariants.strip()
+        )
+
+        # Sort dynamic tools deterministically
+        sorted_dynamic = sorted(
+            [t for t in dynamic_active_tools if t.get("name") not in ("ponytail", "enable_capability")],
+            key=lambda x: x.get("name", ""),
+        )
+        all_tools = list(invariant_tools) + sorted_dynamic
+
+        prefix_repr = {
+            "l1_directive": system_directive.strip(),
+            "l2_l3_tools": all_tools,
+            "l4a_static": canonical_l4a,
+        }
+
+        serialized = json.dumps(prefix_repr, sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def get_volatile_workspace_state(cwd: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Captures active git status and dirty workspace state for Layer 5 injection.
+        Safe with timeouts and bounds.
+        """
+        target_dir = os.path.abspath(cwd or os.getcwd())
+        state: Dict[str, Any] = {
+            "is_git": False,
+            "branch": None,
+            "dirty_files": [],
+            "raw_porcelain": "",
+        }
+
+        try:
+            # Check if inside git work tree
+            is_git_res = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                cwd=target_dir,
+                capture_output=True,
+                text=True,
+                timeout=1.5,
+            )
+            if is_git_res.returncode == 0 and "true" in is_git_res.stdout.strip():
+                state["is_git"] = True
+
+                # Get current branch
+                branch_res = subprocess.run(
+                    ["git", "branch", "--show-current"],
+                    cwd=target_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=1.5,
+                )
+                state["branch"] = branch_res.stdout.strip() or "HEAD (detached)"
+
+                # Get porcelain status (capped at 50 entries to prevent context bloat)
+                status_res = subprocess.run(
+                    ["git", "status", "--porcelain"],
+                    cwd=target_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=2.0,
+                )
+                raw = status_res.stdout.strip()
+                if raw:
+                    lines = raw.splitlines()
+                    state["dirty_files"] = [line[3:].strip() for line in lines[:50]]
+                    state["raw_porcelain"] = "\n".join(lines[:50])
+        except Exception as e:
+            state["error"] = f"Failed to inspect workspace state: {e}"
+
+        return state
+
+    @classmethod
+    def assemble_prompt_layers(
+        cls,
+        system_directive: str,
+        invariant_tools: List[Dict[str, Any]],
+        dynamic_active_tools: List[Dict[str, Any]],
+        l4a_static_invariants: Union[Dict[str, Any], str],
+        l4b_volatile_state: Optional[Union[Dict[str, Any], str]] = None,
+        dynamic_turn_payload: str = "",
     ) -> Dict[str, Any]:
         """
         Deterministic ordering:
         [1. Static System Directives]
         [2. Permanent Invariant Tools] (ponytail + enable_capability)
         [3. Sorted Active Tool Schemas] (alphabetically sorted by name)
-        [4. Dynamic Workspace Anchors]
+        [4. Static Core Invariants]
         [5. Dynamic Turn Payload]
         """
+        # Calculate prefix hash first
+        prefix_hash = cls.compute_prefix_cache_hash(
+            system_directive=system_directive,
+            invariant_tools=invariant_tools,
+            dynamic_active_tools=dynamic_active_tools,
+            l4a_static_invariants=l4a_static_invariants,
+        )
+
         # Sort active dynamic tools deterministically by name
         sorted_dynamic = sorted(
             [t for t in dynamic_active_tools if t.get("name") not in ("ponytail", "enable_capability")],
@@ -160,15 +278,39 @@ class PromptPrefixStabilizer:
 
         all_ordered_tools = list(invariant_tools) + sorted_dynamic
 
+        canonical_l4a = (
+            cls.canonicalize_for_cache(l4a_static_invariants)
+            if isinstance(l4a_static_invariants, dict)
+            else l4a_static_invariants.strip()
+        )
+
+        l4a_text = json.dumps(canonical_l4a, sort_keys=True, indent=2) if isinstance(canonical_l4a, dict) else canonical_l4a
+
         system_content = (
             f"{system_directive}\n\n"
-            f"[Workspace Anchors]\n{workspace_anchors_text}\n"
+            f"[Static Invariants]\n{l4a_text}\n"
         )
+
+        l4b_text = ""
+        if isinstance(l4b_volatile_state, dict) and l4b_volatile_state.get("dirty_files"):
+            branch = l4b_volatile_state.get("branch", "unknown")
+            files_str = "\n".join(f"  - {f}" for f in l4b_volatile_state["dirty_files"])
+            l4b_text = (
+                f"### Active Workspace Volatile State\n"
+                f"- Git Branch: `{branch}`\n"
+                f"- Modified/Untracked Files ({len(l4b_volatile_state['dirty_files'])}):\n{files_str}\n"
+            )
+        elif isinstance(l4b_volatile_state, str) and l4b_volatile_state:
+            l4b_text = f"### Active Workspace Volatile State\n{l4b_volatile_state}"
+
+        turn_payload_parts = [p for p in (l4b_text, dynamic_turn_payload) if p]
+        final_turn_payload = "\n\n".join(turn_payload_parts)
 
         return {
             "system_message": {"role": "system", "content": system_content},
             "ordered_tools": all_ordered_tools,
-            "turn_payload": dynamic_turn_payload,
+            "turn_payload": final_turn_payload,
+            "prefix_cache_hash": prefix_hash,
         }
 
 
@@ -206,6 +348,7 @@ class AgyOrchestrator:
         context: Dict[str, Any],
         call_frontier_model: Optional[Callable[..., AgentResponse]] = None,
         execute_tool: Optional[Callable[[ToolCall], str]] = None,
+        system_message: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         Phase 3: Frontier Model Execution & Meta-Tool Loop.
@@ -219,7 +362,10 @@ class AgyOrchestrator:
         if execute_tool is None:
             execute_tool = self._default_tool_executor
 
-        messages = [{"role": "user", "content": prompt}]
+        messages = []
+        if system_message:
+            messages.append(system_message)
+        messages.append({"role": "user", "content": prompt})
         executed_actions: List[str] = []
         mutated_paths: List[str] = []
         escalation_count = 0
@@ -382,12 +528,44 @@ class AgyOrchestrator:
 
         # Adaptive Output Directive (Section 5.B)
         mode_directive = AdaptiveOutputEngine.get_mode_directive(user_prompt)
-        payload_with_directive = f"{user_prompt}\n{mode_directive}" if mode_directive else user_prompt
+        turn_prompt = f"{user_prompt}\n{mode_directive}" if mode_directive else user_prompt
 
-        # Run Frontier Model & Meta-Tool Loop
+        # 1. Prepare L4a (Static Invariants from Registry)
+        l4a_static = {
+            "repositories": self.registry.system_anchors.get("repositories", []),
+            "workspace_paths": self.registry.system_anchors.get("workspace_paths", []),
+            "config_hubs": self.registry.system_anchors.get("config_hubs", []),
+            "custom_home_scripts": [
+                {"name": s["name"], "path": s["path"]}
+                for s in self.registry.system_anchors.get("custom_home_scripts", [])
+            ],
+            "invariants": [
+                "ponytail minimal diff policy active",
+                "enable_capability hot-loader active",
+                "output ONLY tool invocation block on tool cycles without pre-narration",
+            ],
+        }
+
+        # 2. Extract L4b (Volatile State)
+        l4b_volatile = PromptPrefixStabilizer.get_volatile_workspace_state(cwd=cwd)
+
+        # 3. Phase 3: Assemble All Prompt Layers
+        assembled = PromptPrefixStabilizer.assemble_prompt_layers(
+            system_directive=STATIC_SYSTEM_DIRECTIVE,
+            invariant_tools=self.registry.get_baseline_schemas(),
+            dynamic_active_tools=active_tools,
+            l4a_static_invariants=l4a_static,
+            l4b_volatile_state=l4b_volatile,
+            dynamic_turn_payload=turn_prompt,
+        )
+
+        logger.info("Prefix cache locked with digest: %s", assembled["prefix_cache_hash"][:16])
+
+        # 4. Execute Agent Loop with Assembled Layers
         loop_result = self.run_agent_loop(
-            prompt=payload_with_directive,
-            active_tools=active_tools,
+            prompt=assembled["turn_payload"],
+            system_message=assembled["system_message"],
+            active_tools=assembled["ordered_tools"],
             context=retrieval_context,
             call_frontier_model=call_frontier_model,
             execute_tool=execute_tool,
