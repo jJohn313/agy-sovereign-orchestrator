@@ -13,6 +13,8 @@ from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger("agy.retrieval")
 
+from ephemeral_scout import EphemeralScout
+
 DEFAULT_SIMILARITY_THRESHOLD = 0.75
 WORKSPACES_DB_PATH = os.path.expanduser("~/.cache/workspaces_vec.db")
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
@@ -322,6 +324,7 @@ class TargetedVectorRetriever:
             "codebase_matches": [],
             "mem0_matches": [],
             "formatted_context": "",
+            "pre_resolved_scope": "",
         }
 
         candidates = []
@@ -352,6 +355,19 @@ class TargetedVectorRetriever:
                 })
 
         if not candidates:
+            if codebase_gate > 0.5:
+                scout = EphemeralScout()
+                if scout.is_available():
+                    cwd = os.getcwd()
+                    authoritative_targets = scout.resolve_scope(user_prompt, cwd)
+                    if authoritative_targets:
+                        lines = [
+                            "### Pre-Resolved Execution Scope (Authoritative)",
+                            "The local engine has resolved the target files for this inquiry:"
+                        ]
+                        for target in authoritative_targets:
+                            lines.append(f"- {target}")
+                        context["pre_resolved_scope"] = "\n".join(lines)
             return context
 
         # Sort combined candidates descending by score
