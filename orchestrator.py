@@ -545,6 +545,7 @@ class AgyOrchestrator:
         call_frontier_model: Optional[Callable[..., AgentResponse]] = None,
         execute_tool: Optional[Callable[[ToolCall], str]] = None,
         is_summary_flag: bool = False,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Full 4-Phase Pipeline Execution Lifecycle:
@@ -671,6 +672,8 @@ class AgyOrchestrator:
             actions_summary=summary,
             mutated_paths=loop_result.get("mutated_paths", []),
             cwd=cwd,
+            prefix_cache_hash=assembled.get("prefix_cache_hash"),
+            session_id=session_id,
         )
 
         return {
@@ -680,6 +683,7 @@ class AgyOrchestrator:
             "final_content": final_content,
             "messages": loop_result["messages"],
             "post_result": post_result,
+            "cache_telemetry": post_result.get("cache_telemetry", {}),
             "escalation_count": loop_result.get("escalation_count", 0),
         }
 
