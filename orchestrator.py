@@ -35,7 +35,9 @@ STATIC_SYSTEM_DIRECTIVE = (
     "Follow standard engineering invariants: YAGNI, standard library first, "
     "and minimal atomic diffs. Never hallucinate tools or schemas. "
     "When invoking any tool, emit strictly the tool invocation block without "
-    "preambles, introductory narrations, or intent declarations unless user confirmation was explicitly requested."
+    "preambles, introductory narrations, or intent declarations unless user confirmation was explicitly requested. "
+    "When a 'Pre-Resolved Execution Scope' is provided, treat those files as the authoritative target set. "
+    "Do NOT execute exploratory filesystem searches (find, ls, grep) to discover related files unless an edit produces an unresolved missing-reference error."
 )
 
 
@@ -613,6 +615,10 @@ class AgyOrchestrator:
         # Adaptive Output Directive (Section 5.B)
         mode_directive = AdaptiveOutputEngine.get_mode_directive(user_prompt)
         turn_prompt = f"{user_prompt}\n{mode_directive}" if mode_directive else user_prompt
+
+        pre_resolved_scope = retrieval_context.get("pre_resolved_scope", "")
+        if pre_resolved_scope:
+            turn_prompt = f"{pre_resolved_scope}\n\n{turn_prompt}"
 
         # 1. Prepare L4a (Static Invariants from Registry)
         l4a_static = {
