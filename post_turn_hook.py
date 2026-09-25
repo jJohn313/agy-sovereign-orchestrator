@@ -212,16 +212,103 @@ class PostTurnHook:
             pass
         return {"mode": "non_git_mtime", "reindexed": False, "path": target_dir}
 
+    def _record_cache_telemetry(self, session_id: str, current_hash: str) -> Dict[str, Any]:
+        """Record prefix cache hit/bust telemetry into SQLite WAL session store."""
+        telemetry = {
+            "current_hash": current_hash,
+            "cache_hit": False,
+            "session_hit_rate": 0.0,
+        }
+
+        try:
+            conn = sqlite3.connect(WORKSPACES_DB_PATH, timeout=5.0)
+            with conn:
+                # Initialize table if it doesn't exist
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS prefix_cache_sessions (
+                        session_id TEXT PRIMARY KEY,
+                        last_prefix_cache_hash TEXT,
+                        total_turns INTEGER DEFAULT 0,
+                        cache_hits INTEGER DEFAULT 0,
+                        cache_busts INTEGER DEFAULT 0,
+                        updated_at REAL
+                    );
+                """)
+
+                # Get current session state
+                row = conn.execute(
+                    "SELECT last_prefix_cache_hash, total_turns, cache_hits, cache_busts FROM prefix_cache_sessions WHERE session_id = ?",
+                    (session_id,)
+                ).fetchone()
+
+                if row:
+                    last_hash, total_turns, cache_hits, cache_busts = row
+                    turn_idx = total_turns + 1
+
+                    if last_hash is not None:
+                        if current_hash == last_hash:
+                            cache_hits += 1
+                            telemetry["cache_hit"] = True
+                            logger.debug("[CACHE HIT] Prefix invariant preserved: %s", current_hash[:12])
+                        else:
+                            cache_busts += 1
+                            telemetry["cache_hit"] = False
+                            logger.warning("[CACHE BUST] Prefix divergence at turn %d! %s -> %s", turn_idx, last_hash[:12], current_hash[:12])
+                    else:
+                        telemetry["cache_hit"] = False
+
+                    total_turns += 1
+                else:
+                    last_hash = None
+                    total_turns = 1
+                    cache_hits = 0
+                    cache_busts = 0
+                    turn_idx = 1
+                    telemetry["cache_hit"] = False
+
+                # Calculate session hit rate (Turn 1 is baseline and cannot be a cache hit)
+                if total_turns > 1:
+                    telemetry["session_hit_rate"] = round(cache_hits / (total_turns - 1), 4)
+                else:
+                    telemetry["session_hit_rate"] = 0.0
+
+                # Update session state
+                conn.execute("""
+                    INSERT INTO prefix_cache_sessions (session_id, last_prefix_cache_hash, total_turns, cache_hits, cache_busts, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(session_id) DO UPDATE SET
+                        last_prefix_cache_hash=excluded.last_prefix_cache_hash,
+                        total_turns=excluded.total_turns,
+                        cache_hits=excluded.cache_hits,
+                        cache_busts=excluded.cache_busts,
+                        updated_at=excluded.updated_at
+                """, (session_id, current_hash, total_turns, cache_hits, cache_busts, time.time()))
+
+        except Exception as e:
+            logger.warning("Failed to record cache telemetry: %s", e)
+
+        return telemetry
+
     def process_turn_completion(
         self,
         user_prompt: str,
         actions_summary: str,
         mutated_paths: Optional[List[str]] = None,
         cwd: Optional[str] = None,
+        prefix_cache_hash: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Phase 4: Downstream Write-Gate & Dual-Mode Change Detection.
         """
+        target_cwd = os.path.abspath(cwd or os.getcwd())
+        resolved_session_id = session_id or os.getenv("AGY_SESSION_ID") or target_cwd
+
+        # Record cache telemetry if hash is available
+        cache_telemetry = {}
+        if prefix_cache_hash:
+            cache_telemetry = self._record_cache_telemetry(resolved_session_id, prefix_cache_hash)
+
         # 1. Update registry delta
         if mutated_paths:
             self.registry.update_registry_delta(mutated_paths)
@@ -257,6 +344,7 @@ class PostTurnHook:
             "committed": False,
             "memory_text": None,
             "change_detection": change_info,
+            "cache_telemetry": cache_telemetry,
         }
 
         if durable_score > DURABLE_KNOWLEDGE_THRESHOLD:
