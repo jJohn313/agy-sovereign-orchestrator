@@ -76,5 +76,70 @@ class TestBashGuard(unittest.TestCase):
         self.assertIn("PAGER=cat", res_env)
         self.assertIn("GIT_PAGER=cat", res_env)
 
+    def test_repl_thrash_warning_local(self):
+        ExecTool.reset_eval_counter()
+
+        # 1st call
+        res = ExecTool.execute_shell("python3 -c 'print(1)'")
+        self.assertNotIn("SYSTEM WARNING: REPL micro-probing detected", res)
+
+        # 2nd call
+        res = ExecTool.execute_shell("python3 -c 'print(2)'")
+        self.assertNotIn("SYSTEM WARNING: REPL micro-probing detected", res)
+
+        # 3rd call - should trigger warning
+        res = ExecTool.execute_shell("python3 -c 'print(3)'")
+        self.assertIn("SYSTEM WARNING: REPL micro-probing detected", res)
+        self.assertIn('"status": "ok"', res) # Should not fail
+
+        # Reset counter
+        ExecTool.reset_eval_counter()
+
+    def test_repl_thrash_warning_remote(self):
+        ExecTool.reset_eval_counter()
+
+        # Note: We need a command that succeeds to properly test this without SSH hanging or failing.
+        # However, we only care about the command parsing logic detecting it as an evaluator.
+        # Since we use execute_shell, it will actually run the command.
+        # A fake ssh command will fail. We can mock is_inline_evaluator or just test is_inline_evaluator directly.
+        # Let's test the is_inline_evaluator directly for the wrapping logic.
+
+        self.assertTrue(ExecTool.is_inline_evaluator("ssh host 'python3 -c \"print(1)\"'"))
+        self.assertTrue(ExecTool.is_inline_evaluator("sudo bash -c 'node -e \"console.log(1)\"'"))
+        self.assertTrue(ExecTool.is_inline_evaluator("doas sh -c 'python -c \"print(1)\"'"))
+        self.assertTrue(ExecTool.is_inline_evaluator("ssh -p 22 host 'ruby -e \"puts 1\"'"))
+
+        # Also let's just simulate the counter using execute_shell with a harmless local bash -c wrapping python -c
+        res = ExecTool.execute_shell("bash -c 'python3 -c \"print(1)\"'")
+        self.assertNotIn("SYSTEM WARNING", res)
+
+        res = ExecTool.execute_shell("bash -c 'python3 -c \"print(2)\"'")
+        self.assertNotIn("SYSTEM WARNING", res)
+
+        res = ExecTool.execute_shell("bash -c 'python3 -c \"print(3)\"'")
+        self.assertIn("SYSTEM WARNING", res)
+
+        ExecTool.reset_eval_counter()
+
+    def test_eval_counter_reset(self):
+        ExecTool.reset_eval_counter()
+
+        # 1st call eval
+        ExecTool.execute_shell("python3 -c 'print(1)'")
+        self.assertEqual(ExecTool.consecutive_eval_count, 1)
+
+        # 2nd call eval
+        ExecTool.execute_shell("python3 -c 'print(2)'")
+        self.assertEqual(ExecTool.consecutive_eval_count, 2)
+
+        # Non-evaluator resets counter
+        ExecTool.execute_shell("ls")
+        self.assertEqual(ExecTool.consecutive_eval_count, 0)
+
+        # 3rd eval call doesn't trigger warning
+        res = ExecTool.execute_shell("python3 -c 'print(3)'")
+        self.assertNotIn("SYSTEM WARNING", res)
+        self.assertEqual(ExecTool.consecutive_eval_count, 1)
+
 if __name__ == '__main__':
     unittest.main()

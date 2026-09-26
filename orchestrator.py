@@ -48,7 +48,9 @@ STATIC_SYSTEM_DIRECTIVE = (
     "3. Strictly Non-Interactive & Headless: Never spawn processes that attach to TTY/interactive input loops (nano, vim, less, fzf, rofi, top, bare ssh) without explicit batch/export flags. "
     "4. Bounded Verification & Polling Loops: Never burn API roundtrips repeatedly querying status, databases, sockets, or logs across separate turns to wait for convergence. "
     "Write bounded polling loops directly within the same execution turn (total wait <= 10s), e.g.: "
-    "'for i in $(seq 1 10); do if check_cmd; then break; fi; sleep 1; done; check_cmd || journalctl -u unit -n 20 --no-pager'."
+    "'for i in $(seq 1 10); do if check_cmd; then break; fi; sleep 1; done; check_cmd || journalctl -u unit -n 20 --no-pager'. "
+    "5. Zero-Turn REPL Probing & Schema Consolidation: Never use the environment as an interactive REPL across sequential turns (e.g., repeated 'python3 -c', 'node -e', or iterative curl probes). "
+    "Consolidate all exploratory inspections, API checks, schema validations, and pagination/filtering tests into a single self-contained test script in Turn 1, print only the finalized actionable fields, and immediately proceed to the implementation patch in Turn 2."
 )
 
 
@@ -552,6 +554,7 @@ class AgyOrchestrator:
 
                     if "path" in call_obj.arguments and call_obj.name in ("write_file", "edit_file"):
                         mutated_paths.append(call_obj.arguments["path"])
+                        ExecTool.reset_eval_counter()
 
                     messages.append(response.message)
                     messages.append({
@@ -577,6 +580,8 @@ class AgyOrchestrator:
         3. Ephemeral Per-Turn Tool Scoping & Meta-Tool Loop
         4. Jev Downstream Write-Gate & Dual-Mode Change Detection
         """
+        ExecTool.reset_eval_counter()
+
         cwd = cwd or os.getcwd()
         installed_tool_names = self.registry.list_capabilities()
 
