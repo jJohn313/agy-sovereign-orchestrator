@@ -23,6 +23,7 @@ from retrieval import TargetedVectorRetriever
 from meta_tools import LocalToolRegistry, PONYTAIL_SCHEMA
 from post_turn_hook import PostTurnHook
 from sanitizer import fold_log_output, strip_ansi, find_first_anchor
+from exec_tool import ExecTool
 
 logger = logging.getLogger("agy.orchestrator")
 
@@ -37,7 +38,14 @@ STATIC_SYSTEM_DIRECTIVE = (
     "When invoking any tool, emit strictly the tool invocation block without "
     "preambles, introductory narrations, or intent declarations unless user confirmation was explicitly requested. "
     "When a 'Pre-Resolved Execution Scope' is provided, treat those files as the authoritative target set. "
-    "Do NOT execute exploratory filesystem searches (find, ls, grep) to discover related files unless an edit produces an unresolved missing-reference error."
+    "Do NOT execute exploratory filesystem searches (find, ls, grep) to discover related files unless an edit produces an unresolved missing-reference error. "
+    "[Execution Density & Non-Interactive Protocol] "
+    "1. Compound Scripting Over Micro-Probes: Do not execute single-line discovery or diagnostic commands sequentially across multiple turns. "
+    "Consolidate pipelines (mkdir, config, permissions, service restart) into single compound blocks or self-contained scripts. "
+    "For remote hosts (SSH), execute tasks via consolidated heredocs (ssh host 'bash -s' << 'EOF' ... EOF) rather than sequential single-line SSH calls. "
+    "2. Proactive Diagnostics: When executing commands prone to environmental variance, embed diagnostics in the same execution "
+    "(cmd || { echo '--- DIAGNOSTICS ---'; cmd --help; exit 1; }). Never consume turns solely to run --help or re-read a file just written. "
+    "3. Strictly Non-Interactive & Headless: Never spawn processes that attach to TTY/interactive input loops (nano, vim, less, fzf, rofi, top, bare ssh) without explicit batch/export flags."
 )
 
 
@@ -342,6 +350,16 @@ class AgyOrchestrator:
         """Fallback tool executor with sanitized log folding."""
         if call.name == "ponytail":
             return json.dumps({"status": "ok", "mode": "enforced", "diff_policy": "minimal"})
+
+        # Dispatch shell/terminal commands to ExecTool
+        if call.name in ("run_command", "bash", "terminal", "terminal_action") or "command" in call.arguments or "cmd" in call.arguments:
+            cmd_str = call.arguments.get("command") or call.arguments.get("cmd")
+            if not cmd_str:
+                return fold_log_output(json.dumps({"status": "err", "error": "No command provided to shell tool"}), exit_code=1)
+            cwd = call.arguments.get("cwd")
+            raw_result = ExecTool.execute_shell(cmd_str, cwd=cwd)
+            return fold_log_output(raw_result, exit_code=0)
+
         raw_result = json.dumps({"status": "executed", "tool": call.name, "args": call.arguments})
         return fold_log_output(raw_result, exit_code=0)
 
