@@ -6,17 +6,98 @@ import json
 from typing import Optional, Tuple
 
 class ExecTool:
+    consecutive_eval_count: int = 0
+
     DENYLIST = {
         "rofi", "fzf", "nano", "vim", "vi", "emacs",
         "less", "more", "man", "top", "htop", "btop",
         "watch", "tmux", "screen"
     }
 
+    @classmethod
+    def reset_eval_counter(cls) -> None:
+        cls.consecutive_eval_count = 0
+
     ALLOWED_FLAGS = {
         "rofi": {"-dump-config", "-dump-theme", "-help", "-version"},
         "fzf": {"--filter", "-f", "--version", "--help"},
         "man": {"-P"},
     }
+
+    @staticmethod
+    def is_inline_evaluator(cmd_str: str) -> bool:
+        # Check if the command is an inline evaluator wrapper (e.g. python -c, node -e, etc)
+        # We need to parse wrappers like sudo, ssh, bash -c.
+        try:
+            tokens = shlex.split(cmd_str)
+        except ValueError:
+            tokens = cmd_str.split()
+
+        return ExecTool._is_evaluator_tokens(tokens)
+
+    @staticmethod
+    def _is_evaluator_tokens(tokens: list) -> bool:
+        if not tokens:
+            return False
+
+        # Strip environment variables
+        cmd_tokens = [t for t in tokens if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t)]
+        if not cmd_tokens:
+            return False
+
+        binary = os.path.basename(cmd_tokens[0])
+
+        # Unwrap sudo and doas
+        if binary in ("sudo", "doas") and len(cmd_tokens) > 1:
+            # Sudo might have flags, find the first non-flag
+            idx = 1
+            while idx < len(cmd_tokens) and cmd_tokens[idx].startswith("-"):
+                idx += 1
+            if idx < len(cmd_tokens):
+                return ExecTool._is_evaluator_tokens(cmd_tokens[idx:])
+
+        # Unwrap bash -c, sh -c, zsh -c
+        if binary in ("bash", "sh", "zsh") and len(cmd_tokens) > 2:
+            if cmd_tokens[1] == "-c":
+                inner_cmd = cmd_tokens[2]
+                try:
+                    inner_tokens = shlex.split(inner_cmd)
+                except ValueError:
+                    inner_tokens = inner_cmd.split()
+                return ExecTool._is_evaluator_tokens(inner_tokens)
+
+        # Unwrap ssh
+        if binary == "ssh" and len(cmd_tokens) > 1:
+            # Find the remote command, skip ssh flags
+            ssh_args = cmd_tokens[1:]
+            filtered_args = []
+            skip_next = False
+            for i, arg in enumerate(ssh_args):
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg in ("-p", "-i", "-o", "-l", "-L", "-R", "-D", "-c", "-m", "-F", "-E", "-w", "-b"):
+                    skip_next = True
+                    continue
+                if arg.startswith("-"):
+                    continue
+                filtered_args.append(arg)
+
+            # At this point, filtered_args should be [hostname, "command..."]
+            if len(filtered_args) >= 2:
+                inner_cmd = filtered_args[1]
+                try:
+                    inner_tokens = shlex.split(inner_cmd)
+                except ValueError:
+                    inner_tokens = inner_cmd.split()
+                return ExecTool._is_evaluator_tokens(inner_tokens)
+
+        # Check inline evaluators
+        if binary in ("python", "python3", "node", "ruby", "perl"):
+            if "-c" in cmd_tokens or "-e" in cmd_tokens:
+                return True
+
+        return False
 
     @staticmethod
     def is_interactive_command(cmd_str: str) -> Tuple[bool, str]:
@@ -102,6 +183,12 @@ class ExecTool:
         if is_interactive:
             return json.dumps({"status": "err", "error": error_msg})
 
+        # Track evaluators
+        if ExecTool.is_inline_evaluator(cmd_str):
+            ExecTool.consecutive_eval_count += 1
+        else:
+            ExecTool.reset_eval_counter()
+
         HEADLESS_ENV = {
             **os.environ,
             "PAGER": "cat",
@@ -126,17 +213,26 @@ class ExecTool:
                 env=HEADLESS_ENV,
             )
 
+            stdout_payload = res.stdout.strip()
+            error_payload = res.stderr.strip() or stdout_payload
+
+            if ExecTool.consecutive_eval_count >= 3:
+                warning_msg = "\n\n[SYSTEM WARNING: REPL micro-probing detected. Consolidate further exploratory probes into a single batch test script or proceed directly to the file edit.]"
+                stdout_payload += warning_msg
+                if res.returncode != 0:
+                    error_payload += warning_msg
+
             if res.returncode != 0:
                 return json.dumps({
                     "status": "err",
                     "exit_code": res.returncode,
-                    "error": res.stderr.strip() or res.stdout.strip(),
-                    "stdout": res.stdout.strip()
+                    "error": error_payload,
+                    "stdout": stdout_payload
                 })
             else:
                 return json.dumps({
                     "status": "ok",
-                    "stdout": res.stdout.strip()
+                    "stdout": stdout_payload
                 })
         except subprocess.TimeoutExpired:
             return json.dumps({"status": "err", "error": f"Command timed out after {timeout} seconds"})

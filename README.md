@@ -70,6 +70,7 @@ flowchart TD
 - **SHA-256 Cache Verification Digest:** Computes and logs a canonical SHA-256 hash of the static prefix (`L1` through `L4a`) on every turn to guarantee prefix cache hit verification.
 - **Zero-Narration Tool Directives:** Layer 1 instructs the model to emit only the tool invocation block without pre-thought narration or conversational preambles, cutting output latency and saving 40–100 tokens per loop cycle.
 - **Bounded Verification & Polling Loops (Rule #4):** Mandates that service/socket convergence checks are written as brief, bounded loops directly inside the single turn (total wait $\le 10$s) rather than burning separate API roundtrips polling status.
+- **Zero-Turn REPL Probing & Schema Consolidation (Rule #5):** Consolidates exploratory inspections into a single test script in Turn 1, proceeding immediately to implementation without sequential micro-probing.
 
 ### 2. Multi-Turn ReAct Historical Tool Compaction (`orchestrator.py`)
 - **Sliding-Window Folding:** Prevents quadratic token growth during extended agentic loops.
