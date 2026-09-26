@@ -45,7 +45,10 @@ STATIC_SYSTEM_DIRECTIVE = (
     "For remote hosts (SSH), execute tasks via consolidated heredocs (ssh host 'bash -s' << 'EOF' ... EOF) rather than sequential single-line SSH calls. "
     "2. Proactive Diagnostics: When executing commands prone to environmental variance, embed diagnostics in the same execution "
     "(cmd || { echo '--- DIAGNOSTICS ---'; cmd --help; exit 1; }). Never consume turns solely to run --help or re-read a file just written. "
-    "3. Strictly Non-Interactive & Headless: Never spawn processes that attach to TTY/interactive input loops (nano, vim, less, fzf, rofi, top, bare ssh) without explicit batch/export flags."
+    "3. Strictly Non-Interactive & Headless: Never spawn processes that attach to TTY/interactive input loops (nano, vim, less, fzf, rofi, top, bare ssh) without explicit batch/export flags. "
+    "4. Bounded Verification & Polling Loops: Never burn API roundtrips repeatedly querying status, databases, sockets, or logs across separate turns to wait for convergence. "
+    "Write bounded polling loops directly within the same execution turn (total wait <= 10s), e.g.: "
+    "'for i in $(seq 1 10); do if check_cmd; then break; fi; sleep 1; done; check_cmd || journalctl -u unit -n 20 --no-pager'."
 )
 
 
