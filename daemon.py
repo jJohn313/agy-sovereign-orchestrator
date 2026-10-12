@@ -89,32 +89,37 @@ class OrchestratorDaemon:
             prompt = req.get("user_prompt", "")
             cwd = req.get("cwd", "")
             tools = req.get("available_tools", [])
-            state = f"WORKING_DIR: {cwd}\nAVAILABLE_LOCAL_CAPABILITIES: {', '.join(tools)}\nUSER_PROMPT: {prompt}"
+            state = f'The user asked: "{prompt}"' if prompt else f"WORKING_DIR: {cwd}"
 
-            needs_git = self.engine.noul(state, "This prompt requires git commands, commits, diffs, or repository status.")
-            needs_fs = self.engine.noul(state, "This prompt requires inspecting, reading, or writing specific files or directories.")
-            needs_term = self.engine.noul(state, "This prompt requires running shell commands, build diagnostics, or scripts.")
-            needs_cb = self.engine.noul(state, "This task requires searching the semantic codebase index for symbol or function definitions.")
-            needs_mem = self.engine.noul(state, "This task relies on past user preferences, architectural rules, or setup history.")
+            with self.engine.active_session():
+                propositions = [
+                    "The task requires using git or version control.",
+                    "The task requires reading, writing, or viewing files or directories.",
+                    "The task requires running terminal shell commands or tests.",
+                    "The task requires searching the codebase or symbol definitions.",
+                    "The user is stating a personal preference such as a preferred theme or habit.",
+                ]
+                scores = self.engine.noul_batch(state, propositions)
 
             return {
                 "scores": {
-                    "needs_git": round(needs_git, 4),
-                    "needs_filesystem": round(needs_fs, 4),
-                    "needs_terminal": round(needs_term, 4),
-                    "needs_codebase_search": round(needs_cb, 4),
-                    "needs_user_memory": round(needs_mem, 4),
+                    "needs_git": round(scores[0], 4),
+                    "needs_filesystem": round(scores[1], 4),
+                    "needs_terminal": round(scores[2], 4),
+                    "needs_codebase_search": round(scores[3], 4),
+                    "needs_user_memory": round(scores[4], 4),
                 }
             }
 
         elif action == "filter_post_turn":
             prompt = req.get("user_prompt", "")
             summary = req.get("summary", "")
-            state = f"USER_PROMPT: {prompt}\nRESPONSE_SUMMARY: {summary}"
-            durable = self.engine.noul(
-                state,
-                "This exchange establishes a permanent user preference, key architectural invariant, or durable system config."
-            )
+            state = f'Exchange: User asked "{prompt}" and system responded: "{summary}"'
+            with self.engine.active_session():
+                durable = self.engine.noul(
+                    state,
+                    "This exchange establishes a permanent user preference, key architectural invariant, or durable rule."
+                )
             return {"is_durable_knowledge": round(durable, 4)}
 
         elif action == "check_idle":
@@ -259,7 +264,7 @@ class DaemonClient:
         self.ensure_daemon()
 
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(3.0)
+        sock.settimeout(15.0)
         try:
             sock.connect(self.socket_path)
             sock.sendall(json.dumps(payload).encode("utf-8"))

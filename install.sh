@@ -94,8 +94,33 @@ exec "${HOME}/.config/agy/orchestrator/.venv/bin/python3" "${HOME}/.config/agy/o
 EOF
 chmod +x "${BIN_DIR}/agy"
 
-# 5. Ensure PATH includes ~/.local/bin
-echo "[5/6] Ensuring ~/.local/bin is in PATH..."
+# 5. Install Global Antigravity Lifecycle Hooks
+echo "[5/7] Installing global Antigravity lifecycle hooks..."
+mkdir -p "${HOME}/.gemini/config" "${HOME}/.gemini/antigravity-cli"
+cat << EOF > "${HOME}/.gemini/config/hooks.json"
+{
+  "sovereign-orchestrator": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "${DEST_DIR}/.venv/bin/python3 ${DEST_DIR}/hook_pre_invocation.py",
+        "timeout": 30
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "${DEST_DIR}/.venv/bin/python3 ${DEST_DIR}/hook_post_invocation.py",
+        "timeout": 30
+      }
+    ]
+  }
+}
+EOF
+ln -sf "${HOME}/.gemini/config/hooks.json" "${HOME}/.gemini/antigravity-cli/hooks.json"
+
+# 6. Ensure PATH includes ~/.local/bin
+echo "[6/7] Ensuring ~/.local/bin is in PATH..."
 for RC_FILE in "${HOME}/.bashrc" "${HOME}/.zshrc"; do
     if [ -f "${RC_FILE}" ]; then
         if ! grep -q 'PATH=.*\.local/bin' "${RC_FILE}"; then
@@ -105,8 +130,8 @@ for RC_FILE in "${HOME}/.bashrc" "${HOME}/.zshrc"; do
     fi
 done
 
-# 6. Self-Verification
-echo "[6/6] Running sovereign verification suite..."
+# 7. Self-Verification
+echo "[7/7] Running sovereign verification suite..."
 if "${VENV_PATH}/bin/python3" -m unittest discover -s "${DEST_DIR}/tests"; then
     echo "=========================================================="
     echo " Deployment Succeeded! All verification tests passed."
