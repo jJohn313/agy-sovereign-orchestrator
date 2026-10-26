@@ -17,6 +17,7 @@ import signal
 import logging
 import threading
 import subprocess
+import fcntl
 from typing import Dict, Any, Optional
 
 from local_decision_engine import LocalDecisionEngine
@@ -25,14 +26,18 @@ logger = logging.getLogger("agy.daemon")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [DAEMON] %(message)s")
 
 SOCKET_PATH = os.path.expanduser("~/.config/agy/orchestrator.sock")
+LOCK_PATH = os.path.expanduser("~/.config/agy/orchestrator.lock")
+VENV_PYTHON = "/home/john/.config/agy/orchestrator/.venv/bin/python3"
 IDLE_TIMEOUT_SECONDS = 600  # 10 minutes
 
 
 class OrchestratorDaemon:
     """Unix Domain Socket Daemon hosting the sovereign decision engine."""
 
-    def __init__(self, socket_path: str = SOCKET_PATH):
+    def __init__(self, socket_path: str = SOCKET_PATH, lock_path: str = LOCK_PATH):
         self.socket_path = socket_path
+        self.lock_path = lock_path
+        self.lock_file = None
         self.engine = LocalDecisionEngine()
         self.running = False
         self.server_socket: Optional[socket.socket] = None
@@ -127,6 +132,22 @@ class OrchestratorDaemon:
             unloaded = self.check_idle(force_seconds=force_secs)
             return {"status": "idle_checked", "unloaded": unloaded, "model_loaded": self.engine.model_loaded}
 
+        elif action == "async_reindex":
+            repo_path = req.get("repo_path", "")
+            if repo_path and os.path.exists(repo_path):
+                def _bg_index():
+                    try:
+                        from code_indexer import IncrementalGitIndexer
+                        indexer = IncrementalGitIndexer()
+                        res = indexer.index_repository(repo_path)
+                        logger.info("Async reindex completed for %s: %s", repo_path, res)
+                    except Exception as e:
+                        logger.error("Async reindex failed for %s: %s", repo_path, e)
+
+                threading.Thread(target=_bg_index, daemon=True).start()
+                return {"status": "enqueued", "repo_path": repo_path}
+            return {"status": "error", "message": f"Invalid repo_path: {repo_path}"}
+
         elif action == "reload_tools":
             return {"status": "reloaded"}
 
@@ -138,6 +159,20 @@ class OrchestratorDaemon:
 
     def start(self):
         """Bind Unix Domain Socket and enter event loop."""
+        os.makedirs(os.path.dirname(self.lock_path), exist_ok=True)
+        self.lock_file = open(self.lock_path, "a+")
+        try:
+            fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            logger.info("Another orchestrator daemon is already running (locked %s). Exiting.", self.lock_path)
+            sys.exit(0)
+
+        # Record PID in lock file
+        self.lock_file.seek(0)
+        self.lock_file.truncate()
+        self.lock_file.write(f"{os.getpid()}\n")
+        self.lock_file.flush()
+
         os.makedirs(os.path.dirname(self.socket_path), exist_ok=True)
         if os.path.exists(self.socket_path):
             try:
@@ -147,7 +182,7 @@ class OrchestratorDaemon:
 
         self.server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.server_socket.bind(self.socket_path)
-        self.server_socket.listen(16)
+        self.server_socket.listen(64)
         self.running = True
 
         # Start idle monitor
@@ -194,23 +229,35 @@ class OrchestratorDaemon:
                 os.unlink(self.socket_path)
             except Exception:
                 pass
+        if self.lock_file:
+            try:
+                fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_UN)
+                self.lock_file.close()
+            except Exception:
+                pass
+            if os.path.exists(self.lock_path):
+                try:
+                    os.unlink(self.lock_path)
+                except Exception:
+                    pass
         self.engine.unload_vram()
         logger.info("Daemon cleanly stopped.")
 
 
 class DaemonClient:
-    """Client communicating with OrchestratorDaemon with Stale Socket Recovery (Fix 3)."""
+    """Client communicating with OrchestratorDaemon with Singleton Safety & Stale Recovery."""
 
-    def __init__(self, socket_path: str = SOCKET_PATH):
+    def __init__(self, socket_path: str = SOCKET_PATH, lock_path: str = LOCK_PATH):
         self.socket_path = socket_path
+        self.lock_path = lock_path
 
-    def _try_ping(self) -> bool:
-        """Attempt to ping daemon with 100ms timeout."""
+    def _try_ping(self, timeout: float = 1.5) -> bool:
+        """Attempt to ping daemon with timeout."""
         if not os.path.exists(self.socket_path):
             return False
 
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(0.1)  # 100ms ping timeout
+        sock.settimeout(timeout)
         try:
             sock.connect(self.socket_path)
             sock.sendall(json.dumps({"action": "ping"}).encode("utf-8"))
@@ -224,24 +271,80 @@ class DaemonClient:
             except Exception:
                 pass
 
+    def _is_locked(self) -> bool:
+        """Check if another process holds the exclusive lock."""
+        if not os.path.exists(self.lock_path):
+            return False
+        try:
+            with open(self.lock_path, "r") as f:
+                try:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                    return False
+                except (BlockingIOError, OSError):
+                    return True
+        except Exception:
+            return False
+
     def ensure_daemon(self):
-        """Stale Socket Recovery (Fix 3): ping; if stale/unresponsive, unlink, spawn, and wait."""
-        if self._try_ping():
+        """Ensure exactly one orchestrator daemon is running without duplicating instances."""
+        if self._try_ping(timeout=1.0):
             return
 
-        # Stale socket or daemon not running
+        # If daemon holds the lock, it might be starting up or busy
+        if self._is_locked():
+            deadline = time.time() + 1.2
+            while time.time() < deadline:
+                time.sleep(0.15)
+                if self._try_ping(timeout=0.5):
+                    return
+            # If still not pingable despite holding lock, socket file may be corrupt or desynced
+            logger.warning("Daemon holds lock but fails ping; clearing socket and restarting service...")
+
+        # Not responding and lock is free: try systemd service if available
+        try:
+            res = subprocess.run(
+                ["systemctl", "--user", "is-active", "--quiet", "agy-orchestrator.service"],
+                capture_output=True,
+                timeout=2.0
+            )
+            if res.returncode == 0:
+                # Service is marked active but socket failed to respond: restart to clear stale socket
+                subprocess.run(
+                    ["systemctl", "--user", "restart", "agy-orchestrator.service"],
+                    capture_output=True,
+                    timeout=3.0
+                )
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    time.sleep(0.2)
+                    if self._try_ping(timeout=1.0):
+                        return
+            else:
+                subprocess.run(
+                    ["systemctl", "--user", "start", "agy-orchestrator.service"],
+                    capture_output=True,
+                    timeout=3.0
+                )
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    time.sleep(0.2)
+                    if self._try_ping(timeout=1.0):
+                        return
+        except Exception:
+            pass
+
+        # Standalone fallback: clean up dead socket and spawn detached daemon
         if os.path.exists(self.socket_path):
             try:
                 os.unlink(self.socket_path)
-                logger.info("Unlinked stale socket: %s", self.socket_path)
             except OSError:
                 pass
 
-        # Spawn daemon detached in background
         daemon_script = os.path.join(os.path.dirname(__file__), "daemon.py")
-        venv_python = sys.executable
+        venv_python = VENV_PYTHON if os.path.exists(VENV_PYTHON) else sys.executable
 
-        logger.info("Spawning orchestrator daemon...")
+        logger.info("Spawning single orchestrator daemon...")
         subprocess.Popen(
             [venv_python, daemon_script],
             stdout=subprocess.DEVNULL,
@@ -249,15 +352,14 @@ class DaemonClient:
             start_new_session=True,
         )
 
-        # Wait up to 1.0s for daemon to bind
-        deadline = time.time() + 1.0
+        deadline = time.time() + 3.0
         while time.time() < deadline:
-            time.sleep(0.04)
-            if self._try_ping():
+            time.sleep(0.1)
+            if self._try_ping(timeout=1.0):
                 logger.info("Daemon ready and responding to ping.")
                 return
 
-        logger.warning("Daemon did not respond within 1.0s; will fallback to in-process engine.")
+        logger.warning("Daemon did not respond within 3.0s; will fallback to in-process engine.")
 
     def send_request(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Send request to daemon with automatic retry and recovery."""

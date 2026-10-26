@@ -7,6 +7,7 @@ Features:
 """
 
 import os
+import sys
 import time
 import shutil
 import sqlite3
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 from jev_client import JevClient
 from meta_tools import LocalToolRegistry
+from code_indexer import IncrementalGitIndexer
 
 logger = logging.getLogger("agy.post_turn_hook")
 
@@ -53,7 +55,47 @@ class PostTurnHook:
         self.registry = registry or LocalToolRegistry()
         self.user_id = user_id
         self._memory = None
+        self.git_indexer = IncrementalGitIndexer(WORKSPACES_DB_PATH)
         ensure_sqlite_wal(WORKSPACES_DB_PATH)
+
+    def dispatch_async_reindex(self, repo_path: str, reason: str = "") -> bool:
+        """
+        Dispatches an asynchronous, detached reindex task without blocking the turn loop.
+        Prioritizes Unix domain socket IPC to OrchestratorDaemon, falling back to detached process.
+        """
+        try:
+            from daemon import DaemonClient
+            client = DaemonClient()
+            if client._try_ping(timeout=0.8):
+                resp = client.send_request({
+                    "action": "async_reindex",
+                    "repo_path": repo_path,
+                    "reason": reason,
+                })
+                if resp and resp.get("status") == "enqueued":
+                    logger.info("Enqueued async reindex via daemon for %s (%s)", repo_path, reason)
+                    return True
+        except Exception as e:
+            logger.debug("Daemon async_reindex dispatch skipped: %s", e)
+
+        # Fallback to detached process
+        try:
+            orch_dir = os.path.dirname(os.path.abspath(__file__))
+            venv_python = os.path.join(orch_dir, ".venv/bin/python3")
+            if not os.path.exists(venv_python):
+                venv_python = sys.executable
+            indexer_script = os.path.join(orch_dir, "code_indexer.py")
+            subprocess.Popen(
+                [venv_python, indexer_script, "--repo", repo_path],
+                start_new_session=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.info("Spawned detached background indexer for %s (%s)", repo_path, reason)
+            return True
+        except Exception as e:
+            logger.warning("Failed to dispatch async reindex: %s", e)
+            return False
 
     def _get_memory(self):
         if self._memory is None:
@@ -115,37 +157,32 @@ class PostTurnHook:
 
     def detect_changes_and_reindex(self, cwd: Optional[str] = None) -> Dict[str, Any]:
         """
-        Dual-Mode Change Detection (Fix 2):
-        1. Check: git rev-parse --is-inside-work-tree
-        2. Git Workspace: If git status --porcelain has output -> sem-index $(git rev-parse --show-toplevel)
-        3. Non-Git Workspace: Check file mtime against ~/.cache/agy/last_turn_ts -> sem-index $(pwd)
+        Dual-Mode Change Detection (Fix 2 & Hybrid Upgrade):
+        1. Commit Divergence: Check if git HEAD != last_indexed_commit in code_repos.
+           If diverged or newly mounted repository -> trigger async incremental AST indexing.
+        2. Git Working Tree: If git status --porcelain has dirty files -> sem-index $(git rev-parse --show-toplevel).
+        3. Non-Git Workspace: Check file mtime against ~/.cache/agy/last_turn_ts -> sem-index $(pwd).
         """
         target_dir = os.path.abspath(cwd or os.getcwd())
         ensure_sqlite_wal(WORKSPACES_DB_PATH)
 
-        # 1. Check Git
-        is_git = False
-        toplevel = None
-        try:
-            res_git = subprocess.run(
-                ["git", "rev-parse", "--is-inside-work-tree"],
-                cwd=target_dir,
-                capture_output=True,
-                text=True,
-            )
-            is_git = res_git.returncode == 0 and "true" in res_git.stdout.strip().lower()
-            if is_git:
-                top_res = subprocess.run(
-                    ["git", "rev-parse", "--show-toplevel"],
-                    cwd=target_dir,
-                    capture_output=True,
-                    text=True,
+        # 1. Check Git & Commit Divergence
+        div_info = self.git_indexer.check_commit_divergence(target_dir)
+        if div_info.get("is_git"):
+            toplevel = div_info.get("repo_path")
+            if div_info.get("diverged"):
+                logger.info(
+                    "Commit divergence detected in %s (%s -> %s); dispatching async reindex",
+                    toplevel,
+                    div_info.get("last_commit"),
+                    div_info.get("head_commit"),
                 )
-                toplevel = top_res.stdout.strip()
-        except Exception:
-            is_git = False
+                self.dispatch_async_reindex(toplevel, reason="commit_divergence")
+                if shutil.which("sem-index"):
+                    subprocess.run(["sem-index", toplevel], capture_output=True)
+                return {"mode": "git", "reindexed": True, "path": toplevel, "reason": "commit_divergence"}
 
-        if is_git and toplevel:
+            # If commit is up-to-date, check if working tree has dirty modifications
             status_res = subprocess.run(
                 ["git", "status", "--porcelain"],
                 cwd=target_dir,
@@ -157,8 +194,8 @@ class PostTurnHook:
                     logger.info("Git modifications detected in %s; triggering sem-index", toplevel)
                     subprocess.run(["sem-index", toplevel], capture_output=True)
                 else:
-                    logger.warning("Git modifications detected in %s, but 'sem-index' is not installed or not in PATH.", toplevel)
-                return {"mode": "git", "reindexed": True, "path": toplevel}
+                    logger.warning("Git modifications detected in %s, but 'sem-index' is not in PATH.", toplevel)
+                return {"mode": "git", "reindexed": True, "path": toplevel, "reason": "dirty_worktree"}
             return {"mode": "git", "reindexed": False, "path": toplevel}
 
         # 2. Non-Git Workspace (mtime detection)
@@ -317,6 +354,16 @@ class PostTurnHook:
         change_info = self.detect_changes_and_reindex(cwd=cwd)
 
         # 3. Downstream Jev/NLI Write Filter (via IPC daemon if available and not custom mocked)
+        prompt_lower = user_prompt.lower()
+        if any(tag in prompt_lower for tag in ["mem0_bypass", "zero_persistence", "mem0 bypass", "zero persistence", "mem0 directive", "do not log this session"]):
+            return {
+                "durable_score": 0.0,
+                "committed": False,
+                "memory_text": None,
+                "change_detection": change_info,
+                "cache_telemetry": cache_telemetry,
+            }
+
         durable_score = 0.0
         if not self._custom_jev:
             try:

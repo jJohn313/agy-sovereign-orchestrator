@@ -79,6 +79,12 @@ def main():
         return
 
     try:
+        # Enforce zero-persistence / Mem0 bypass pragma
+        prompt_lower = user_prompt.lower()
+        if any(tag in prompt_lower for tag in ["mem0_bypass", "zero_persistence", "mem0 bypass", "zero persistence", "mem0 directive", "do not log this session"]):
+            print("{}")
+            return
+
         # Check if durable memory filter is needed (when user prompt contains directive/remember/preference keywords)
         keywords = ["remember", "always", "never", "preference", "rule", "policy", "config", "architectural", "invariant"]
         if any(kw in user_prompt.lower() for kw in keywords):
@@ -97,6 +103,14 @@ def main():
                     stderr=subprocess.DEVNULL,
                     timeout=5,
                 )
+    except Exception:
+        pass
+
+    try:
+        # Detect commit divergence or workspace modifications and dispatch async reindexing
+        from post_turn_hook import PostTurnHook
+        hook = PostTurnHook()
+        hook.detect_changes_and_reindex(cwd=cwd)
     except Exception:
         pass
 

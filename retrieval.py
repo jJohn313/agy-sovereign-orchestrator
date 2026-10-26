@@ -1,7 +1,11 @@
 """
-Targeted Vector Retrieval & Fault-Tolerant AST Parsing Layer for AGY (Fix 8 & Fix 9).
-Wraps Codebase index and Mem0 vector database with strict cosine similarity filtering (>= 0.75),
-SQLite WAL concurrency, and fault-tolerant code outline extraction.
+Targeted Hybrid Retrieval & Fault-Tolerant AST Parsing Layer for AGY.
+Wraps Codebase index and Mem0 vector database with:
+- Hybrid Code Search: Dense (sqlite-vec) + Sparse (FTS5 BM25)
+- Reciprocal Rank Fusion (RRF)
+- Semantic Vector MMR Deduplication (cosine similarity >= 0.80) replacing Jaccard
+- Strict Top-4 candidate budget and canonical [codebase:path:lines] tagging
+- SQLite WAL concurrency protection
 """
 
 import os
@@ -10,6 +14,7 @@ import re
 import sqlite3
 import logging
 from typing import Dict, Any, List, Optional, Tuple
+import numpy as np
 
 logger = logging.getLogger("agy.retrieval")
 
@@ -31,6 +36,22 @@ def compute_jaccard_similarity(text_a: str, text_b: str) -> float:
     intersection = len(tokens_a & tokens_b)
     union = len(tokens_a | tokens_b)
     return intersection / union if union > 0 else 0.0
+
+
+def compute_cosine_similarity(vec_a: Any, vec_b: Any) -> float:
+    """Computes cosine similarity between two 1D embedding vectors."""
+    if vec_a is None or vec_b is None:
+        return 0.0
+    try:
+        a = np.asarray(vec_a, dtype=np.float32)
+        b = np.asarray(vec_b, dtype=np.float32)
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return float(np.dot(a, b) / (norm_a * norm_b))
+    except Exception:
+        return 0.0
 
 
 # Regex fallback pattern for broken code or non-Python code
@@ -58,65 +79,47 @@ def extract_ast_outline(code: str, target_symbol: Optional[str] = None) -> str:
     """
     Fault-tolerant structural outline extraction.
     Tries Python ast.parse(); on SyntaxError or parsing error, falls back immediately
-    to a regex-based structural scanner.
+    to fast regex extraction of definitions.
+    If target_symbol is provided, attempts to capture its full body as well.
     """
     outline_lines: List[str] = []
     symbol_body: Optional[str] = None
 
     try:
-        tree = ast.parse(code)
-        lines = code.splitlines()
+        parsed = ast.parse(code)
+        code_lines = code.splitlines()
 
-        for node in ast.iter_child_nodes(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                start = getattr(node, "lineno", 1) - 1
-                end = getattr(node, "end_lineno", start + 1)
-                outline_lines.append("\n".join(lines[start:end]))
+        for node in parsed.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+                outline_lines.append(f"{prefix} {node.name}(...) (line {node.lineno})")
+                if target_symbol and node.name == target_symbol:
+                    end_lineno = getattr(node, "end_lineno", node.lineno)
+                    symbol_body = "\n".join(code_lines[node.lineno - 1 : end_lineno])
+
             elif isinstance(node, ast.ClassDef):
-                doc = ast.get_docstring(node)
-                doc_summary = f'    """{doc.splitlines()[0]}"""' if doc else ""
-                outline_lines.append(f"\nclass {node.name}:")
-                if doc_summary:
-                    outline_lines.append(doc_summary)
+                outline_lines.append(f"class {node.name} (line {node.lineno}):")
+                if target_symbol and node.name == target_symbol:
+                    end_lineno = getattr(node, "end_lineno", node.lineno)
+                    symbol_body = "\n".join(code_lines[node.lineno - 1 : end_lineno])
 
                 for item in node.body:
                     if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        fdoc = ast.get_docstring(item)
-                        fdoc_sum = f'        """{fdoc.splitlines()[0]}"""' if fdoc else ""
-                        args_list = [a.arg for a in item.args.args]
-                        outline_lines.append(f"    def {item.name}({', '.join(args_list)}): ...")
-                        if fdoc_sum:
-                            outline_lines.append(fdoc_sum)
+                        prefix = "async def" if isinstance(item, ast.AsyncFunctionDef) else "def"
+                        outline_lines.append(f"    {prefix} {item.name}(...) (line {item.lineno})")
+                        if target_symbol and item.name == target_symbol:
+                            end_lineno = getattr(item, "end_lineno", item.lineno)
+                            symbol_body = "\n".join(code_lines[item.lineno - 1 : end_lineno])
 
-                if target_symbol and node.name == target_symbol:
-                    start = getattr(node, "lineno", 1) - 1
-                    end = getattr(node, "end_lineno", len(lines))
-                    symbol_body = "\n".join(lines[start:end])
-
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                doc = ast.get_docstring(node)
-                doc_summary = f'    """{doc.splitlines()[0]}"""' if doc else ""
-                args_list = [a.arg for a in node.args.args]
-                prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
-                outline_lines.append(f"{prefix} {node.name}({', '.join(args_list)}): ...")
-                if doc_summary:
-                    outline_lines.append(doc_summary)
-
-                if target_symbol and node.name == target_symbol:
-                    start = getattr(node, "lineno", 1) - 1
-                    end = getattr(node, "end_lineno", len(lines))
-                    symbol_body = "\n".join(lines[start:end])
-
-    except Exception as parse_err:
-        logger.info("AST parse failed (%s); falling back to regex structural scan", parse_err)
-        lines = code.splitlines()
-        outline_lines.append("# [AST Fallback: Regex Structural Extraction]")
-        for idx, line in enumerate(lines, 1):
+    except Exception:
+        # Fault-tolerant regex fallback
+        outline_lines = ["[AST Fallback: Regex Structural Extraction]"]
+        code_lines = code.splitlines()
+        for idx, line in enumerate(code_lines, 1):
             if STRUCTURAL_REGEX.match(line):
-                outline_lines.append(f"{line.rstrip()}  # L{idx}")
+                outline_lines.append(f"{line.strip()} (line {idx})")
                 if target_symbol and target_symbol in line:
-                    # Capture surrounding block
-                    symbol_body = "\n".join(lines[max(0, idx - 1) : min(len(lines), idx + 35)])
+                    symbol_body = "\n".join(code_lines[idx - 1 : min(idx + 30, len(code_lines))])
 
     header = "\n".join(outline_lines)
     if symbol_body:
@@ -150,8 +153,20 @@ def read_file_content_smart(file_path: str, target_symbol: Optional[str] = None)
         return f"# Error reading {file_path}: {err}"
 
 
+def sanitize_fts5_query(query: str) -> str:
+    """Sanitize raw prompt text into safe FTS5 query terms."""
+    terms = re.findall(r"[a-zA-Z0-9_\.]+", query)
+    if not terms:
+        return ""
+    safe_terms = [f'"{t}"' for t in terms[:12] if len(t) >= 2]
+    return " OR ".join(safe_terms)
+
+
 class CodebaseRetriever:
-    """Vector search over workspaces and codebase index with SQLite WAL protection."""
+    """
+    Hybrid Code Search over AST code chunks and workspaces index.
+    Combines dense sqlite-vec embeddings with sparse FTS5 BM25 ranks via RRF.
+    """
 
     def __init__(self, db_path: str = WORKSPACES_DB_PATH, threshold: float = DEFAULT_SIMILARITY_THRESHOLD):
         self.db_path = db_path
@@ -175,56 +190,214 @@ class CodebaseRetriever:
 
     def search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """
-        Query semantic codebase index using sqlite-vec.
-        Filters strictly by cosine similarity >= threshold.
+        Query hybrid code index using sqlite-vec + FTS5 BM25 with RRF.
+        Returns candidates with precomputed embeddings for downstream MMR.
         """
         conn = self._get_connection()
         if conn is None:
             return []
 
         embedder = get_embedder()
-        if embedder is None:
-            conn.close()
-            return []
-
         try:
-            import sqlite_vec
-            embeddings = list(embedder.embed([query]))
-            if not embeddings:
-                conn.close()
-                return []
-            query_embedding = embeddings[0].tolist()
-            query_bytes = sqlite_vec.serialize_float32(query_embedding)
+            # 1. Check if code_chunks table exists
+            table_check = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='code_chunks';"
+            ).fetchone()
+            has_code_chunks = bool(table_check)
 
-            cursor = conn.cursor()
-            query_sql = """
-                SELECT w.path, w.name, w.summary, v.distance
-                FROM vec_workspaces v
-                JOIN workspaces w ON w.id = v.workspace_id
-                WHERE v.embedding MATCH ? AND k = ?
-                ORDER BY v.distance ASC
-            """
-            rows = cursor.execute(query_sql, (query_bytes, limit)).fetchall()
+            results: List[Dict[str, Any]] = []
+
+            if has_code_chunks:
+                results = self._search_hybrid_chunks(conn, query, embedder, limit)
+
+            # If no code chunks found, fall back to workspaces summary index
+            if not results:
+                results = self._search_workspaces(conn, query, embedder, limit)
+
             conn.close()
+            return results
 
-            filtered_results: List[Dict[str, Any]] = []
-            for path, name, summary, dist in rows:
-                similarity = max(0.0, 1.0 - dist)
-                if similarity >= self.threshold:
-                    filtered_results.append({
-                        "path": path,
-                        "name": name,
-                        "summary": summary,
-                        "similarity": round(similarity, 4),
-                    })
-            return filtered_results
         except Exception as err:
-            logger.error("Error querying codebase vector db: %s", err)
+            logger.error("Error in hybrid codebase search: %s", err)
             try:
                 conn.close()
             except Exception:
                 pass
             return []
+
+    def _search_hybrid_chunks(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        embedder: Any,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Execute dense vec_code_chunks + sparse code_fts and merge via RRF."""
+        import sqlite_vec
+
+        dense_candidates: Dict[int, Dict[str, Any]] = {}
+        dense_ranks: Dict[int, int] = {}
+
+        # 1. Dense Search
+        if embedder is not None:
+            embeddings = list(embedder.embed([query]))
+            if embeddings:
+                query_embedding = embeddings[0].tolist()
+                query_bytes = sqlite_vec.serialize_float32(query_embedding)
+
+                query_sql = """
+                    SELECT c.id, c.file_path, c.symbol_breadcrumb, c.symbol_type,
+                           c.start_line, c.end_line, c.content, v.distance, v.embedding
+                    FROM vec_code_chunks v
+                    JOIN code_chunks c ON c.id = v.chunk_id
+                    WHERE v.embedding MATCH ? AND k = ?
+                    ORDER BY v.distance ASC
+                """
+                try:
+                    rows = conn.execute(query_sql, (query_bytes, limit * 4)).fetchall()
+                    for rank_idx, (cid, path, breadcrumb, stype, start_l, end_l, content, dist, emb_blob) in enumerate(rows, 1):
+                        sim = max(0.0, 1.0 - dist)
+                        emb = np.frombuffer(emb_blob, dtype=np.float32).tolist() if emb_blob else None
+                        dense_candidates[cid] = {
+                            "id": cid,
+                            "path": path,
+                            "name": breadcrumb,
+                            "summary": content,
+                            "symbol_type": stype,
+                            "start_line": start_l,
+                            "end_line": end_l,
+                            "dense_sim": sim,
+                            "embedding": emb,
+                        }
+                        dense_ranks[cid] = rank_idx
+                except Exception as e:
+                    logger.debug("Dense chunk query error: %s", e)
+
+        # 2. Sparse FTS5 Search
+        sparse_candidates: Dict[int, Dict[str, Any]] = {}
+        sparse_ranks: Dict[int, int] = {}
+        fts_query = sanitize_fts5_query(query)
+
+        if fts_query:
+            fts_sql = """
+                SELECT c.id, c.file_path, c.symbol_breadcrumb, c.symbol_type,
+                       c.start_line, c.end_line, c.content, bm25(code_fts) as score
+                FROM code_fts
+                JOIN code_chunks c ON c.id = code_fts.rowid
+                WHERE code_fts MATCH ?
+                ORDER BY score ASC
+                LIMIT ?
+            """
+            try:
+                rows = conn.execute(fts_sql, (fts_query, limit * 4)).fetchall()
+                for rank_idx, (cid, path, breadcrumb, stype, start_l, end_l, content, bm_score) in enumerate(rows, 1):
+                    sparse_candidates[cid] = {
+                        "id": cid,
+                        "path": path,
+                        "name": breadcrumb,
+                        "summary": content,
+                        "symbol_type": stype,
+                        "start_line": start_l,
+                        "end_line": end_l,
+                        "bm25_score": bm_score,
+                    }
+                    sparse_ranks[cid] = rank_idx
+            except Exception as e:
+                logger.debug("Sparse chunk query error: %s", e)
+
+        # 3. Reciprocal Rank Fusion (RRF)
+        all_ids = set(dense_candidates.keys()) | set(sparse_candidates.keys())
+        if not all_ids:
+            return []
+
+        fused = []
+        k_rrf = 60
+        w_dense = 0.6
+        w_sparse = 0.4
+
+        for cid in all_ids:
+            score_dense = 0.0
+            score_sparse = 0.0
+            if cid in dense_ranks:
+                score_dense = w_dense / (k_rrf + dense_ranks[cid])
+            if cid in sparse_ranks:
+                score_sparse = w_sparse / (k_rrf + sparse_ranks[cid])
+            rrf_score = score_dense + score_sparse
+
+            # Retrieve candidate metadata
+            cand = dense_candidates.get(cid) or sparse_candidates.get(cid)
+            cand_copy = dict(cand)
+
+            # Compute normalized similarity score for Layer 5 / gating threshold
+            # Dense matches use dense_sim boosted by sparse match presence;
+            # Sparse exact symbol hits receive authoritative score (>= 0.85)
+            if cid in dense_candidates and cid in sparse_ranks:
+                dense_sim = cand_copy.get("dense_sim", 0.0)
+                final_sim = max(min(1.0, dense_sim + 0.08), 0.85)
+            elif cid in dense_candidates:
+                final_sim = cand_copy.get("dense_sim", 0.0)
+            else:
+                final_sim = 0.85  # Pure lexical exact hit
+
+            cand_copy["rrf_score"] = rrf_score
+            cand_copy["similarity"] = round(final_sim, 4)
+
+            # Fetch embedding if not already present
+            if cand_copy.get("embedding") is None:
+                row_emb = conn.execute("SELECT embedding FROM vec_code_chunks WHERE chunk_id = ?", (cid,)).fetchone()
+                if row_emb and row_emb[0]:
+                    cand_copy["embedding"] = np.frombuffer(row_emb[0], dtype=np.float32).tolist()
+
+            if cand_copy["similarity"] >= self.threshold:
+                fused.append(cand_copy)
+
+        # Sort descending by RRF score
+        fused.sort(key=lambda x: x["rrf_score"], reverse=True)
+        return fused[:limit]
+
+    def _search_workspaces(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        embedder: Any,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Legacy fallback to workspaces table."""
+        if embedder is None:
+            return []
+        ws_check = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='vec_workspaces';"
+        ).fetchone()
+        if not ws_check:
+            return []
+        import sqlite_vec
+        embeddings = list(embedder.embed([query]))
+        if not embeddings:
+            return []
+        query_embedding = embeddings[0].tolist()
+        query_bytes = sqlite_vec.serialize_float32(query_embedding)
+
+        query_sql = """
+            SELECT w.path, w.name, w.summary, v.distance, v.embedding
+            FROM vec_workspaces v
+            JOIN workspaces w ON w.id = v.workspace_id
+            WHERE v.embedding MATCH ? AND k = ?
+            ORDER BY v.distance ASC
+        """
+        rows = conn.execute(query_sql, (query_bytes, limit)).fetchall()
+        filtered_results: List[Dict[str, Any]] = []
+        for path, name, summary, dist, emb_blob in rows:
+            similarity = max(0.0, 1.0 - dist)
+            if similarity >= self.threshold:
+                emb = np.frombuffer(emb_blob, dtype=np.float32).tolist() if emb_blob else None
+                filtered_results.append({
+                    "path": path,
+                    "name": name,
+                    "summary": summary,
+                    "similarity": round(similarity, 4),
+                    "embedding": emb,
+                })
+        return filtered_results
 
 
 class Mem0Retriever:
@@ -250,53 +423,57 @@ class Mem0Retriever:
                             "embedding_model_dims": 384,
                         },
                     },
-                    "history_db_path": os.path.expanduser("~/.local/share/mem0/history.db"),
                     "embedder": {
                         "provider": "fastembed",
-                        "config": {"model": "BAAI/bge-small-en-v1.5"},
-                    },
-                    "llm": {
-                        "provider": "openai",
-                        "config": {"api_key": "dummy-local-key"},
+                        "config": {
+                            "model": EMBEDDING_MODEL_NAME,
+                        },
                     },
                     "version": "v1.1",
                 }
                 self._memory = Memory.from_config(mem_config)
             except Exception as e:
-                logger.warning("Could not initialize Mem0 memory: %s", e)
+                logger.error("Failed connecting to Mem0 memory: %s", e)
                 self._memory = None
         return self._memory
 
     def search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
         """
-        Query Mem0 for user preferences and architectural rules.
+        Query user memory vector store.
         Filters strictly by cosine similarity >= threshold.
         """
         memory = self._get_memory()
-        if not memory:
+        if memory is None:
             return []
 
         try:
-            res = memory.search(query, filters={"user_id": self.user_id}, limit=limit)
-            items = res.get("results", []) if isinstance(res, dict) else res
-            filtered: List[Dict[str, Any]] = []
-            for item in items:
-                score = float(item.get("score", 0.0))
+            results = memory.search(query=query, user_id=self.user_id, limit=limit)
+            filtered_results: List[Dict[str, Any]] = []
+            memories = results.get("results", []) if isinstance(results, dict) else results
+
+            for item in memories:
+                score = item.get("score", 0.0)
                 if score >= self.threshold:
-                    filtered.append({
+                    filtered_results.append({
                         "id": item.get("id"),
                         "memory": item.get("memory", ""),
                         "score": round(score, 4),
-                        "created_at": item.get("created_at"),
                     })
-            return filtered
+            return filtered_results
         except Exception as err:
-            logger.error("Error querying Mem0 memory: %s", err)
+            logger.error("Error querying Mem0: %s", err)
             return []
 
 
 class TargetedVectorRetriever:
-    """Unified retrieval coordinator evaluating Jev/NLI gates and retrieving context."""
+    """
+    Retrieval coordinator: Codebase + Mem0 vector retrieval.
+    Enforces:
+    - Codebase Gate > 0.5 & Mem0 Gate > 0.5 triggers
+    - Hard cap max_k = 4
+    - Semantic Vector MMR (cosine similarity >= 0.80) replacing lexical Jaccard
+    - Canonical Layer 5 output formatting
+    """
 
     def __init__(
         self,
@@ -316,9 +493,9 @@ class TargetedVectorRetriever:
     ) -> Dict[str, Any]:
         """
         Phase 2: Targeted Vector Retrieval.
-        - If Codebase Gate > 0.5: Query Codebase index, filter >= 0.75.
-        - If Mem0 Gate > 0.5: Query Mem0 vector DB, filter >= 0.75.
-        - Applies dynamic Top-K capping (max_k=4) and MMR Jaccard deduplication.
+        - If Codebase Gate > 0.5: Query Codebase index, filter >= threshold.
+        - If Mem0 Gate > 0.5: Query Mem0 vector DB, filter >= threshold.
+        - Applies dynamic Top-K capping (max_k=4) and Semantic Vector MMR deduplication.
         """
         context: Dict[str, Any] = {
             "codebase_matches": [],
@@ -339,7 +516,8 @@ class TargetedVectorRetriever:
                     "path": m["path"],
                     "name": m["name"],
                     "text": m.get("summary") or m.get("name") or "",
-                    "raw": m
+                    "embedding": m.get("embedding"),
+                    "raw": m,
                 })
 
         if mem0_gate > 0.5:
@@ -351,7 +529,8 @@ class TargetedVectorRetriever:
                     "score": m["score"],
                     "id": m.get("id"),
                     "text": m.get("memory") or "",
-                    "raw": m
+                    "embedding": m.get("embedding"),
+                    "raw": m,
                 })
 
         if not candidates:
@@ -363,7 +542,7 @@ class TargetedVectorRetriever:
                     if authoritative_targets:
                         lines = [
                             "### Pre-Resolved Execution Scope (Authoritative)",
-                            "The local engine has resolved the target files for this inquiry:"
+                            "The local engine has resolved the target files for this inquiry:",
                         ]
                         for target in authoritative_targets:
                             lines.append(f"- {target}")
@@ -380,12 +559,39 @@ class TargetedVectorRetriever:
             if len(accepted) >= max_k:
                 break
 
-            # Check Jaccard similarity against already accepted candidates
+            cand_emb = cand.get("embedding")
+            if cand_emb is None and cand.get("text"):
+                # Lazily embed candidate text for vector comparison if not pre-computed
+                embedder = get_embedder()
+                if embedder is not None:
+                    try:
+                        embs = list(embedder.embed([cand["text"]]))
+                        if embs:
+                            cand_emb = embs[0].tolist()
+                            cand["embedding"] = cand_emb
+                    except Exception:
+                        cand_emb = None
+
             is_redundant = False
-            for acc in accepted:
-                if compute_jaccard_similarity(cand["text"], acc["text"]) > 0.60:
-                    is_redundant = True
-                    break
+            if cand_emb is not None:
+                for acc in accepted:
+                    acc_emb = acc.get("embedding")
+                    if acc_emb is not None:
+                        sim = compute_cosine_similarity(cand_emb, acc_emb)
+                        if sim >= 0.80:
+                            is_redundant = True
+                            break
+                    else:
+                        # Fallback to Jaccard if comparing against unvectorized item
+                        if compute_jaccard_similarity(cand["text"], acc["text"]) > 0.60:
+                            is_redundant = True
+                            break
+            else:
+                # Fallback to lexical Jaccard if no embedding is available
+                for acc in accepted:
+                    if compute_jaccard_similarity(cand["text"], acc["text"]) > 0.60:
+                        is_redundant = True
+                        break
 
             if not is_redundant:
                 accepted.append(cand)
@@ -393,12 +599,11 @@ class TargetedVectorRetriever:
         if not accepted:
             return context
 
-        # Format surviving chunks
+        # Format surviving chunks strictly to preserve Layer 5 prefix cache format
         lines = []
         for item in accepted:
             if item["source"] == "codebase":
                 path = item["path"]
-
                 raw = item.get("raw", {})
                 start_line = raw.get("start_line")
                 end_line = raw.get("end_line")
@@ -407,7 +612,6 @@ class TargetedVectorRetriever:
                 else:
                     tag = f"[codebase:{path}]"
 
-                # Assuming summary contains the content. Extract just the first line for snippet.
                 summary_snippet = item["text"].strip().split("\n")[0]
                 lines.append(f"- {tag} ({item['score']:.2f}) {summary_snippet}")
             elif item["source"] == "mem0":
@@ -417,19 +621,7 @@ class TargetedVectorRetriever:
                 lines.append(f"- {tag} ({item['score']:.2f}) {item['text']}")
 
         context["formatted_context"] = "\n".join(lines)
-
-        # We should also filter the returned codebase_matches and mem0_matches?
-        # The prompt says: "Return {'codebase_matches': [], 'mem0_matches': [], 'formatted_context': ''} if no candidates"
-        # Since we modified the raw matches arrays, maybe we shouldn't prune them, just `formatted_context` matters for Layer 5.
-        # Wait, the objective says "Implement a hard cap of max_k = 4 on final retrieved chunks."
-        # If Layer 5 only uses `formatted_context`, keeping matches as-is is fine, but to be safe we can filter them.
-
-        # Actually I will just return the full matches arrays since the prompt only focuses on the formatted_context string and deduplication.
-        # Let's filter the actual returned matches to only include the accepted ones, it's safer.
-        final_codebase = [item["raw"] for item in accepted if item["source"] == "codebase"]
-        final_mem0 = [item["raw"] for item in accepted if item["source"] == "mem0"]
-
-        context["codebase_matches"] = final_codebase
-        context["mem0_matches"] = final_mem0
+        context["codebase_matches"] = [item["raw"] for item in accepted if item["source"] == "codebase"]
+        context["mem0_matches"] = [item["raw"] for item in accepted if item["source"] == "mem0"]
 
         return context

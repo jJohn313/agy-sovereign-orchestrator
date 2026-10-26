@@ -76,6 +76,70 @@ class TestRetrievalMMR(unittest.TestCase):
 
         self.assertTrue("[codebase:/path/to/file_with_lines.py:10-20]" in result["formatted_context"])
 
+    def test_vector_mmr_vs_jaccard_divergence(self):
+        """
+        Verify that semantic vector MMR suppresses duplicate concepts with 0% lexical overlap,
+        which lexical Jaccard completely fails to catch.
+        """
+        # Vector A: e.g. representation of "database connection pool"
+        emb_a = [1.0, 0.0, 0.0, 0.0]
+        # Vector B: semantically identical embedding (cosine similarity = 1.0)
+        emb_b = [1.0, 0.0, 0.0, 0.0]
+        # Vector C: distinctly different embedding (cosine similarity = 0.0)
+        emb_c = [0.0, 1.0, 0.0, 0.0]
+
+        codebase_mock = MagicMock(spec=CodebaseRetriever)
+        codebase_mock.search.return_value = [
+            {
+                "similarity": 0.95,
+                "path": "/path/to/db_alpha.py",
+                "name": "DB Alpha",
+                "summary": "initialize storage repository connections",
+                "embedding": emb_a,
+            },
+            {
+                "similarity": 0.94,
+                "path": "/path/to/db_beta.py",
+                "name": "DB Beta",
+                # Completely distinct words: lexical Jaccard is 0.0!
+                "summary": "boot up persistency sockets cluster",
+                "embedding": emb_b,
+            },
+            {
+                "similarity": 0.88,
+                "path": "/path/to/auth.py",
+                "name": "Auth Service",
+                "summary": "validate session tokens and cryptographic credentials",
+                "embedding": emb_c,
+            },
+        ]
+
+        mem0_mock = MagicMock(spec=Mem0Retriever)
+        mem0_mock.search.return_value = []
+
+        retriever = TargetedVectorRetriever(
+            codebase_retriever=codebase_mock,
+            mem0_retriever=mem0_mock,
+            threshold=0.75,
+        )
+
+        result = retriever.retrieve("database setup", codebase_gate=1.0, mem0_gate=0.0)
+
+        # Lexical Jaccard between summary 1 and 2 is 0.0:
+        jaccard = compute_jaccard_similarity(
+            "initialize storage repository connections",
+            "boot up persistency sockets cluster"
+        )
+        self.assertEqual(jaccard, 0.0)
+
+        # But Vector MMR recognizes emb_a and emb_b are semantically identical (cosine >= 0.80),
+        # so db_beta.py must be suppressed!
+        accepted_paths = [m["path"] for m in result["codebase_matches"]]
+        self.assertIn("/path/to/db_alpha.py", accepted_paths)
+        self.assertNotIn("/path/to/db_beta.py", accepted_paths)
+        self.assertIn("/path/to/auth.py", accepted_paths)
+        self.assertEqual(len(accepted_paths), 2)
+
     def test_no_op_empty_results(self):
         codebase_mock = MagicMock(spec=CodebaseRetriever)
         codebase_mock.search.return_value = []

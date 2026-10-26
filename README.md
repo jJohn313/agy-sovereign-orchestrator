@@ -123,6 +123,28 @@ flowchart TD
 - **Dual-Mode Change Detection (`post_turn_hook.py`):** Automatically detects Git modifications or non-Git file `mtime` changes to trigger `sem-index`.
 - **SQLite WAL Concurrency:** Protects `~/.cache/workspaces_vec.db` with WAL mode and `PRAGMA busy_timeout = 5000`.
 
+### 10. Zero-Persistence & Mem0 Memory Isolation Directives
+- **Pragma Bypassing:** When prompts contain `[MEM0 DIRECTIVE: DO NOT LOG THIS SESSION TO EXTERNAL MEMORY. LOCAL REUSE ONLY.]` or `<!-- PRAGMA: ZERO_PERSISTENCE, MEM0_BYPASS -->`:
+  - `hook_pre_invocation.py` sets `mem_gate = 0.0`, completely bypassing external vector memory retrieval.
+  - `hook_post_invocation.py` and `post_turn_hook.py` immediately suppress DeBERTa durable knowledge extraction, guaranteeing 0 writes to Mem0.
+- Guarantees ephemeral, machine-isolated sessions for automated batch pipelines, university worksheets, and sensitive local evaluations.
+
+### 11. Headless & Batch Pipeline Execution (`agy exec -`)
+- **Non-Interactive Piping:** Seamlessly handles piped prompts (`subprocess.run(["agy", "exec", "-"], input=...)`) or inline arguments without curses overhead or interactive banners.
+- **Workspace-Aware Project Tagging:** Automatically resolves working directory scope (e.g. tagging Obsidian `StudyVault` sessions with `--project study-vault`) to isolate batch automation from standard CLI project history.
+
+### 12. Workspace-Aware Session Management (`agy_manager.py`)
+- **Terminal Scoping:** When running `agy` or `agy list`, the manager detects whether the working directory is inside a dedicated workspace (e.g., `StudyVault/`) and filters conversations accordingly.
+- **Interactive Scope Toggle:** In the curses session selector, pressing `[Tab]` instantly toggles between `[Projects]` and `[StudyVault]` views.
+- **Ambiguity & Polluting Prevention:** Prevents batch runs from cluttering primary software development chat history while keeping them fully accessible in their own workspace.
+
+### 13. Frontier Surgical Reasoning Gateway (`invoke_argon.py`)
+- **Two-Tier Scout/Reasoner Architecture:** Gemini 3.8 Flash scouts AST symbols and minified slices for free; Gemini 4 Argon executes deep surgical reasoning.
+- **Thought-Safe Multi-Part Extraction:** Safely extracts text parts while filtering out internal chain-of-thought blocks (`thought: True`).
+- **Batch Multi-Symbol Escalation:** When Argon requests missing context via `[NEED_CONTEXT: file#symbol]`, `re.findall` batch-resolves all requested slices in a single turn, preserving native multi-part conversation history (`candidate['content']`) and benefiting from implicit prefix caching (at $\ge 4{,}096$ tokens).
+- **Ambiguity-Protected 3-Tier Patching:** Resilient search-and-replace engine handling trailing whitespace differences, indentation offsets, multiple match collision rejection (`count > 1`), and CRLF/LF line-ending preservation.
+
+
 ---
 
 ## 🚀 Quick Deployment

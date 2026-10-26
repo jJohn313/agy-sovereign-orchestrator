@@ -755,12 +755,40 @@ def main():
 
     subcmd = args[0]
     if subcmd in ("select", "-s", "--select", "list", "ls", "--list", "rename", "title", "auto-titles", "titles") and os.path.exists(manager_path):
-        os.execv(python_bin, [python_bin, manager_path] + args[1:])
+        os.execv(python_bin, [python_bin, manager_path] + args)
         return
 
     if subcmd in ("-n", "--new") and os.path.exists(orig_bin):
         os.execv(orig_bin, [orig_bin] + args[1:])
         return
+
+    if subcmd == "exec":
+        # Stream or read from stdin if "-" specified or piped
+        raw_prompt = ""
+        if "-" in args[1:] or not sys.stdin.isatty():
+            raw_prompt = sys.stdin.read()
+        else:
+            remaining = [a for a in args[1:] if a != "-"]
+            raw_prompt = " ".join(remaining)
+
+        # Determine project ID based on working directory
+        cwd = os.getcwd()
+        project_name = "study-vault" if ("studyvault" in cwd.lower() or "documents/obsidian/studyvault" in cwd.lower()) else "default-cli-project"
+
+        # Forward directly to original agy binary in non-interactive print mode
+        if orig_bin and os.path.exists(orig_bin):
+            proc = subprocess.run(
+                [orig_bin, "--output-format", "text", "--project", project_name],
+                input=raw_prompt,
+                text=True,
+                capture_output=True,
+            )
+            if proc.returncode != 0:
+                sys.stderr.write(proc.stderr)
+                sys.exit(proc.returncode)
+            sys.stdout.write(proc.stdout)
+            sys.exit(0)
+
 
     json_output = False
     is_summary_flag = False

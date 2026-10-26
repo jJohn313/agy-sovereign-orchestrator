@@ -42,7 +42,7 @@ def get_latest_user_prompt(transcript_path: str) -> str:
             if not line:
                 continue
             try:
-                if '"type":"USER_INPUT"' in line:
+                if '"USER_INPUT"' in line:
                     data = json.loads(line)
                     if data.get("type") == "USER_INPUT":
                         content = data.get("content", "")
@@ -99,6 +99,9 @@ def main():
         # Phase 2: Targeted Vector Retrieval
         cb_gate = scores.get("needs_codebase_search", 0.0)
         mem_gate = scores.get("needs_user_memory", 0.0)
+        prompt_lower = user_prompt.lower()
+        if any(tag in prompt_lower for tag in ["mem0_bypass", "zero_persistence", "mem0 bypass", "zero persistence", "mem0 directive", "do not log this session"]):
+            mem_gate = 0.0
 
         retrieval_text = ""
         if cb_gate >= 0.75 or mem_gate >= 0.75:
@@ -109,15 +112,11 @@ def main():
                     codebase_gate=cb_gate,
                     mem0_gate=mem_gate,
                 )
-                parts = []
-                mem_matches = ret_ctx.get("mem0_matches", [])
-                if mem_matches:
-                    parts.append("### Retrieved User Memory / Directives:\n" + "\n".join(mem_matches))
-                cb_matches = ret_ctx.get("codebase_matches", [])
-                if cb_matches:
-                    parts.append("### Retrieved Codebase References:\n" + "\n".join(cb_matches))
-                retrieval_text = "\n\n".join(parts)
-            except Exception:
+                formatted = ret_ctx.get("formatted_context", "")
+                if formatted:
+                    retrieval_text = f"### Retrieved Codebase References & Directives:\n{formatted}"
+            except Exception as e:
+                pass
                 pass
 
         # Phase 3: Build Injected Directives
