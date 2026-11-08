@@ -177,11 +177,30 @@ def main():
 
         if is_away:
             reasons_str = "; ".join(away_reasons)
+            away_thread_id = None
+            try:
+                sys.path.insert(0, "/home/john/Repositories/agy-voice-hub")
+                from agy_voice.discord_hub import get_or_create_workflow_thread
+                conv_tag = "session"
+                if transcript_path:
+                    parts = transcript_path.split("/")
+                    for p in parts:
+                        if len(p) == 36 and p.count("-") == 4:
+                            conv_tag = p[:8]
+                            break
+                thread_name = f"Away: AGY [{conv_tag}] ({os.path.basename(cwd) or '~'})"
+                away_thread_id = get_or_create_workflow_thread(thread_name)
+            except Exception:
+                pass
+
+            thread_directive = f"3. An isolated Discord thread has been spawned for this session: Thread ID `{away_thread_id}`. Route updates via `/home/john/scripts/discord_voice_bot.py --channel {away_thread_id} --summary ...`\n" if away_thread_id else ""
+
             directive_parts.append(
                 f"[REMOTE / AWAY MODE DETECTED: {reasons_str}]\n"
                 f"John is NOT at his desk. When finishing a task, reaching a milestone, or requiring input:\n"
                 f"1. Post summaries and screenshots into his dedicated Telegram Forum Topic using `/home/john/scripts/telegram_voice.py --summary ...`\n"
-                f"2. High-priority voice briefing/decision can be dispatched via Telegram voice audio note or Discord voice.\n"
+                f"2. High-priority voice briefing/decision can be dispatched via Discord voice (`/home/john/scripts/discord_voice_bot.py --voice ...`).\n"
+                f"{thread_directive}"
                 f"Do not wait for terminal input at the desk."
             )
 
