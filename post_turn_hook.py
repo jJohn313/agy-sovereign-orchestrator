@@ -400,4 +400,22 @@ class PostTurnHook:
             result["committed"] = committed
             result["memory_text"] = memory_text
 
+        # Episodic Troubleshooting Fix Extraction
+        try:
+            from fix_ledger import FixLedger
+            fl = FixLedger()
+            cand = fl.extract_candidate_fix(user_prompt, actions_summary)
+            if cand:
+                from daemon import DaemonClient
+                d_client = DaemonClient()
+                recorded = d_client.record_fix(
+                    domain=cand["domain"],
+                    symptom=cand["symptom"],
+                    root_cause=cand["root_cause"],
+                    verified_fix=cand["verified_fix"],
+                )
+                result["fix_recorded"] = recorded
+        except Exception as e:
+            logger.debug("Episodic fix extraction skipped: %s", e)
+
         return result

@@ -28,7 +28,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [DAEMON] %(message)s
 SOCKET_PATH = os.path.expanduser("~/.config/agy/orchestrator.sock")
 LOCK_PATH = os.path.expanduser("~/.config/agy/orchestrator.lock")
 VENV_PYTHON = "/home/john/.config/agy/orchestrator/.venv/bin/python3"
-IDLE_TIMEOUT_SECONDS = 600  # 10 minutes
+IDLE_TIMEOUT_SECONDS = int(os.getenv("AGY_IDLE_TIMEOUT", "20"))  # Auto-exit after 20s idle to free RAM
 
 
 class OrchestratorDaemon:
@@ -47,21 +47,24 @@ class OrchestratorDaemon:
     def check_idle(self, force_seconds: Optional[int] = None) -> bool:
         """
         Check if idle time exceeded limit.
-        If idle > 10 minutes (or force_seconds > 600), offload VRAM.
+        If idle > IDLE_TIMEOUT_SECONDS, offload VRAM and terminate daemon to release host RAM.
         """
         elapsed = force_seconds if force_seconds is not None else (time.time() - self.last_activity_time)
         if elapsed >= IDLE_TIMEOUT_SECONDS:
             if self.engine.model_loaded:
                 self.engine.unload_vram()
-                return True
+            logger.info("Idle timeout reached (%.1fs >= %ds). Terminating daemon to reclaim RAM/VRAM.", elapsed, IDLE_TIMEOUT_SECONDS)
+            self.running = False
+            return True
         return False
 
     def _idle_monitor_loop(self):
-        """Background thread checking for 10-minute idle inactivity."""
+        """Background thread checking for idle inactivity."""
         while self.running:
-            time.sleep(10)
+            time.sleep(2)
             with self.lock:
-                self.check_idle()
+                if self.check_idle():
+                    break
 
     def handle_request(self, req: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch IPC requests."""
@@ -126,6 +129,36 @@ class OrchestratorDaemon:
                     "This exchange establishes a permanent user preference, key architectural invariant, or durable rule."
                 )
             return {"is_durable_knowledge": round(durable, 4)}
+
+        elif action == "query_fixes":
+            query = req.get("query", "")
+            domain = req.get("domain", None)
+            limit = req.get("limit", 2)
+            threshold = req.get("threshold", 0.80)
+            try:
+                from fix_ledger import FixLedger
+                fl = FixLedger()
+                matches = fl.search_fixes(query, domain=domain, limit=limit, score_threshold=threshold)
+                directive = fl.format_directive(matches) if matches else ""
+                return {"status": "ok", "matches": matches, "directive": directive}
+            except Exception as e:
+                logger.error("Daemon query_fixes failed: %s", e)
+                return {"status": "error", "message": str(e), "matches": [], "directive": ""}
+
+        elif action == "record_fix":
+            domain = req.get("domain", "")
+            symptom = req.get("symptom", "")
+            root_cause = req.get("root_cause", "")
+            verified_fix = req.get("verified_fix", "")
+            tags = req.get("tags", None)
+            try:
+                from fix_ledger import FixLedger
+                fl = FixLedger()
+                ok = fl.record_fix(domain, symptom, root_cause, verified_fix, tags=tags)
+                return {"status": "ok", "recorded": ok}
+            except Exception as e:
+                logger.error("Daemon record_fix failed: %s", e)
+                return {"status": "error", "message": str(e), "recorded": False}
 
         elif action == "check_idle":
             force_secs = req.get("force_seconds", 601)
@@ -315,7 +348,7 @@ class DaemonClient:
                     capture_output=True,
                     timeout=3.0
                 )
-                deadline = time.time() + 3.0
+                deadline = time.time() + 6.0
                 while time.time() < deadline:
                     time.sleep(0.2)
                     if self._try_ping(timeout=1.0):
@@ -326,7 +359,7 @@ class DaemonClient:
                     capture_output=True,
                     timeout=3.0
                 )
-                deadline = time.time() + 3.0
+                deadline = time.time() + 6.0
                 while time.time() < deadline:
                     time.sleep(0.2)
                     if self._try_ping(timeout=1.0):
@@ -352,14 +385,14 @@ class DaemonClient:
             start_new_session=True,
         )
 
-        deadline = time.time() + 3.0
+        deadline = time.time() + 6.0
         while time.time() < deadline:
             time.sleep(0.1)
             if self._try_ping(timeout=1.0):
                 logger.info("Daemon ready and responding to ping.")
                 return
 
-        logger.warning("Daemon did not respond within 3.0s; will fallback to in-process engine.")
+        logger.warning("Daemon did not respond within 6.0s; will fallback to in-process engine.")
 
     def send_request(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Send request to daemon with automatic retry and recovery."""
@@ -382,6 +415,62 @@ class DaemonClient:
             except Exception:
                 pass
         return None
+
+    def query_fixes(self, query: str, domain: Optional[str] = None, threshold: float = 0.80) -> str:
+        """Query fix ledger via daemon or local fallback."""
+        try:
+            resp = self.send_request({
+                "action": "query_fixes",
+                "query": query,
+                "domain": domain,
+                "threshold": threshold,
+            })
+            if resp and resp.get("status") == "ok":
+                return resp.get("directive", "")
+        except Exception:
+            pass
+
+        # In-process fallback
+        try:
+            from fix_ledger import FixLedger
+            fl = FixLedger()
+            matches = fl.search_fixes(query, domain=domain, score_threshold=threshold)
+            return fl.format_directive(matches) if matches else ""
+        except Exception as e:
+            logger.warning("query_fixes fallback failed: %s", e)
+            return ""
+
+    def record_fix(
+        self,
+        domain: str,
+        symptom: str,
+        root_cause: str,
+        verified_fix: str,
+        tags: Optional[List[str]] = None,
+    ) -> bool:
+        """Record verified fix via daemon or local fallback."""
+        try:
+            resp = self.send_request({
+                "action": "record_fix",
+                "domain": domain,
+                "symptom": symptom,
+                "root_cause": root_cause,
+                "verified_fix": verified_fix,
+                "tags": tags,
+            })
+            if resp and resp.get("status") == "ok":
+                return resp.get("recorded", False)
+        except Exception:
+            pass
+
+        # In-process fallback
+        try:
+            from fix_ledger import FixLedger
+            fl = FixLedger()
+            return fl.record_fix(domain, symptom, root_cause, verified_fix, tags=tags)
+        except Exception as e:
+            logger.warning("record_fix fallback failed: %s", e)
+            return False
 
 
 if __name__ == "__main__":

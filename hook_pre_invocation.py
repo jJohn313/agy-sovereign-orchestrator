@@ -130,6 +130,61 @@ def main():
         if retrieval_text:
             directive_parts.append(retrieval_text)
 
+        # Phase 2.5: Episodic Troubleshooting Fix Retrieval
+        try:
+            fix_directive = client.query_fixes(user_prompt, threshold=0.80)
+            if fix_directive:
+                directive_parts.append(f"### Verified Prior Troubleshooting Solutions:\n{fix_directive}")
+        except Exception:
+            pass
+
+        # Detect Away / Headless / SSH Mode
+        is_away = False
+        away_reasons = []
+
+        # 1. Semantic away intent (avoids false positives like 'refactor this away' or 'throw away')
+        away_patterns = [
+            r"\b(?:i\s+am|i\'?m|i\s+will\s+be|i\'?ll\s+be|going|heading|stepping|step)\s+away\b",
+            r"\baway\s+from\s+(?:my\s+)?(?:desk|pc|computer|screen)\b",
+            r"\bnot\s+(?:at|on|in\s+front\s+of)\s+(?:my\s+)?(?:desk|pc|computer|screen)\b",
+            r"\b(?:leave|leaving)\s+(?:my\s+)?(?:desk|pc|computer)\b",
+            r"\bafk\b",
+        ]
+        if any(re.search(pat, user_prompt, re.IGNORECASE) for pat in away_patterns):
+            is_away = True
+            away_reasons.append("Prompt indicates user is stepping away / not at desk")
+
+        # 2. Super+Shift+H Headless mode flag
+        if os.path.exists("/tmp/headless_away_mode"):
+            is_away = True
+            away_reasons.append("Headless Away power-saving mode active (/tmp/headless_away_mode)")
+
+        # 3. All DPMS monitors off
+        try:
+            res_dpms = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True, timeout=2)
+            if res_dpms.returncode == 0 and res_dpms.stdout.strip():
+                mon_data = json.loads(res_dpms.stdout)
+                if mon_data and all(not m.get("dpmsStatus", True) for m in mon_data):
+                    is_away = True
+                    away_reasons.append("All Hyprland monitors powered off (DPMS off)")
+        except Exception:
+            pass
+
+        # 4. SSH session detected
+        if os.getenv("SSH_CONNECTION") or os.getenv("SSH_CLIENT") or os.getenv("SSH_TTY"):
+            is_away = True
+            away_reasons.append("Connected via remote SSH session")
+
+        if is_away:
+            reasons_str = "; ".join(away_reasons)
+            directive_parts.append(
+                f"[REMOTE / AWAY MODE DETECTED: {reasons_str}]\n"
+                f"John is NOT at his desk. When finishing a task, reaching a milestone, or requiring input:\n"
+                f"1. Post summaries and screenshots into his dedicated Telegram Forum Topic using `/home/john/scripts/telegram_voice.py --summary ...`\n"
+                f"2. High-priority voice briefing/decision can be dispatched via Telegram voice audio note or Discord voice.\n"
+                f"Do not wait for terminal input at the desk."
+            )
+
         injected_message = "\n".join(directive_parts)
 
         result = {
