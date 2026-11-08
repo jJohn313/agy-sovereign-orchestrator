@@ -754,11 +754,6 @@ def main():
         return
 
     subcmd = args[0]
-    cockpit_path = os.path.join(home_dir, ".config", "agy", "orchestrator", "tui_cockpit.py")
-    if subcmd in ("cockpit", "--cockpit", "tui", "--tui") and os.path.exists(cockpit_path):
-        os.execv(python_bin, [python_bin, cockpit_path] + args[1:])
-        return
-
     if subcmd in ("select", "-s", "--select", "list", "ls", "--list", "rename", "title", "auto-titles", "titles") and os.path.exists(manager_path):
         os.execv(python_bin, [python_bin, manager_path] + args)
         return
