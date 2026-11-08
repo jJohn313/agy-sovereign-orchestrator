@@ -18,7 +18,7 @@ import logging
 import threading
 import subprocess
 import fcntl
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from local_decision_engine import LocalDecisionEngine
 
