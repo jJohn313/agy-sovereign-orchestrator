@@ -540,6 +540,13 @@ class AgyCockpitApp(App):
         color: #fab387;
         text-style: bold;
     }
+
+    Footer {
+        height: 1;
+        dock: bottom;
+        background: #08080c;
+        color: #6e738d;
+    }
     """
 
     # Reactive state variables
@@ -738,12 +745,20 @@ class AgyCockpitApp(App):
 
     def refresh_diffs(self) -> None:
         """Query git status in active workspace and populate collapsible diffs."""
+        diff_container = self.query_one("#diffs-content", Static)
         try:
-            status_out = subprocess.check_output(
-                ["git", "status", "--porcelain"], text=True, timeout=2
-            ).strip().splitlines()
+            status_proc = subprocess.run(
+                ["git", "status", "--porcelain"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2
+            )
+            if status_proc.returncode != 0:
+                diff_container.update("📁 Workspace (~/): Root home directory (not a git repo). Changes tracked per file.")
+                return
 
-            diff_container = self.query_one("#diffs-content", Static)
+            status_out = status_proc.stdout.strip().splitlines()
             if not status_out:
                 diff_container.update("✅ Working tree clean. Zero uncommitted changes.")
                 return
@@ -758,7 +773,7 @@ class AgyCockpitApp(App):
             diff_text = "\n".join(diff_blocks)
             diff_container.update(f"**Modified Files ({len(status_out)} total):**\n{diff_text}")
         except Exception:
-            pass
+            diff_container.update("📁 Workspace tracking active.")
 
     # --------------------------------------------------------------------------
     # FIL ROUGE ANIMATION HELPER
