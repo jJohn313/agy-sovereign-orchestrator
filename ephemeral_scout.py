@@ -4,11 +4,48 @@ import logging
 import subprocess
 import urllib.request
 import urllib.error
+import fcntl
+import time
+from contextlib import contextmanager
 from typing import List
 
 import re
 
 logger = logging.getLogger("agy.ephemeral_scout")
+LOCK_PATH = "/tmp/agy_qwen_scout.lock"
+
+
+@contextmanager
+def _acquire_qwen_lock(timeout: float = 3.0):
+    """Ensure strictly single-instance execution of Qwen across AGY instances."""
+    lock_file = None
+    acquired = False
+    start_time = time.time()
+    try:
+        lock_file = open(LOCK_PATH, "a+")
+        while time.time() - start_time < timeout:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (BlockingIOError, OSError):
+                time.sleep(0.05)
+        if not acquired:
+            logger.warning("Another AGY instance is executing Qwen scout; skipping to prevent concurrent VRAM contention")
+            yield False
+            return
+        yield True
+    finally:
+        if acquired and lock_file:
+            try:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        if lock_file:
+            try:
+                lock_file.close()
+            except Exception:
+                pass
 
 def compute_jaccard_similarity(text_a: str, text_b: str) -> float:
     """Computes word-level Jaccard similarity between two strings."""
@@ -90,6 +127,19 @@ class EphemeralScout:
         scored.sort(key=lambda x: x[1], reverse=True)
         return [c for c, _ in scored[:15]]
 
+    def purge_vram(self) -> None:
+        """Force Ollama to immediately purge the model from VRAM."""
+        try:
+            req = urllib.request.Request(
+                f"{self.base_url}/api/generate",
+                data=json.dumps({"model": self.model_name, "keep_alive": 0}).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=1.5):
+                pass
+        except Exception as e:
+            logger.debug(f"Failed to purge {self.model_name} from VRAM: {e}")
+
     def resolve_scope(self, query: str, cwd: str) -> List[str]:
         """Use SLM to pick 1-3 most critical paths, anti-hallucination filtered."""
         candidates = self._generate_candidates(query, cwd)
@@ -113,27 +163,33 @@ class EphemeralScout:
             "keep_alive": 0
         }
 
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            f"{self.base_url}/api/generate",
-            data=data,
-            headers={"Content-Type": "application/json"}
-        )
+        with _acquire_qwen_lock(timeout=3.0) as locked:
+            if not locked:
+                return []
 
-        try:
-            with urllib.request.urlopen(req, timeout=2.5) as response:
-                result = json.loads(response.read().decode("utf-8"))
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"{self.base_url}/api/generate",
+                data=data,
+                headers={"Content-Type": "application/json"}
+            )
 
-                resp_obj = json.loads(result.get("response", "{}"))
-                slm_targets = resp_obj.get("targets", [])
+            try:
+                with urllib.request.urlopen(req, timeout=2.5) as response:
+                    result = json.loads(response.read().decode("utf-8"))
 
-                # Anti-hallucination filter
-                authoritative_targets = [
-                    p for p in slm_targets
-                    if p in candidates and os.path.exists(os.path.join(cwd, p))
-                ]
+                    resp_obj = json.loads(result.get("response", "{}"))
+                    slm_targets = resp_obj.get("targets", [])
 
-                return authoritative_targets
-        except Exception as e:
-            logger.warning(f"EphemeralScout resolution skipped or failed: {e}; falling back to standard discovery")
-            return []
+                    # Anti-hallucination filter
+                    authoritative_targets = [
+                        p for p in slm_targets
+                        if p in candidates and os.path.exists(os.path.join(cwd, p))
+                    ]
+
+                    return authoritative_targets
+            except Exception as e:
+                logger.warning(f"EphemeralScout resolution skipped or failed: {e}; falling back to standard discovery")
+                return []
+            finally:
+                self.purge_vram()

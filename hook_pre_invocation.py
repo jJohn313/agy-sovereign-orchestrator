@@ -104,7 +104,8 @@ def main():
             mem_gate = 0.0
 
         retrieval_text = ""
-        if cb_gate >= 0.75 or mem_gate >= 0.75:
+        pre_scope_text = ""
+        if cb_gate > 0.5 or mem_gate > 0.5:
             try:
                 retriever = TargetedVectorRetriever()
                 ret_ctx = retriever.retrieve(
@@ -113,10 +114,12 @@ def main():
                     mem0_gate=mem_gate,
                 )
                 formatted = ret_ctx.get("formatted_context", "")
-                if formatted:
+                pre_scope = ret_ctx.get("pre_resolved_scope", "")
+                if pre_scope:
+                    pre_scope_text = pre_scope
+                if formatted and formatted != pre_scope:
                     retrieval_text = f"### Retrieved Codebase References & Directives:\n{formatted}"
             except Exception as e:
-                pass
                 pass
 
         # Phase 3: Build Injected Directives
@@ -127,6 +130,8 @@ def main():
             "Mandatory Policies: Ponytail minimal diff policy strictly enforced (no redundant prose, minimal targeted edits, stdlib/native first). Silent reuse-first gate. Search before reading whole files.",
         ]
 
+        if pre_scope_text:
+            directive_parts.append(pre_scope_text)
         if retrieval_text:
             directive_parts.append(retrieval_text)
 
