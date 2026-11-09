@@ -81,6 +81,7 @@ class FixLedger:
         point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{domain_clean}:{symptom_clean}"))
 
         payload = {
+            "entry_type": "fix",
             "domain": domain_clean,
             "symptom": symptom_clean,
             "root_cause": root_cause_clean,
@@ -109,15 +110,68 @@ class FixLedger:
             logger.error("Failed to record fix in ledger: %s", e)
             return False
 
+    def record_dead_end(
+        self,
+        domain: str,
+        forbidden_approach: str,
+        failure_symptom: str,
+        root_cause: str,
+        tags: Optional[List[str]] = None,
+    ) -> bool:
+        """
+        Record a proven dead-end / architectural anti-pattern to prevent future relapse.
+        """
+        domain_clean = (domain or "general").strip().lower()
+        forbidden_clean = (forbidden_approach or "").strip()
+        symptom_clean = (failure_symptom or "").strip()
+        root_cause_clean = (root_cause or "").strip()
+
+        if not forbidden_clean or not symptom_clean:
+            return False
+
+        searchable_text = f"[{domain_clean}] FORBIDDEN ANTI-PATTERN: {forbidden_clean} | Symptom: {symptom_clean} | Root cause: {root_cause_clean}"
+        point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{domain_clean}:dead_end:{forbidden_clean}"))
+
+        payload = {
+            "entry_type": "dead_end",
+            "domain": domain_clean,
+            "forbidden_approach": forbidden_clean,
+            "symptom": symptom_clean,
+            "root_cause": root_cause_clean,
+            "verified_fix": f"DO NOT USE: {forbidden_clean}. Symptom: {symptom_clean}. Cause: {root_cause_clean}",
+            "tags": tags or [domain_clean, "dead_end"],
+            "recorded_at": time.time(),
+        }
+
+        try:
+            vector = self._embed_text(searchable_text)
+            client = QdrantClient(path=self.qdrant_path)
+            client.upsert(
+                collection_name=COLLECTION_NAME,
+                points=[
+                    PointStruct(
+                        id=point_id,
+                        vector=vector,
+                        payload=payload,
+                    )
+                ],
+            )
+            client.close()
+            logger.info("Recorded proven dead-end into ledger [%s]: %s", domain_clean, forbidden_clean[:60])
+            return True
+        except Exception as e:
+            logger.error("Failed to record dead end in ledger: %s", e)
+            return False
+
     def search_fixes(
         self,
         query: str,
         domain: Optional[str] = None,
-        limit: int = 2,
+        limit: int = 3,
         score_threshold: float = 0.80,
     ) -> List[Dict[str, Any]]:
         """
-        Search for relevant past fixes matching current query / error trace.
+        Search for relevant past fixes and proven dead-ends matching current query / error trace.
         """
         if not query or not query.strip():
             return []
@@ -141,7 +195,9 @@ class FixLedger:
                     continue
                 matches.append({
                     "score": round(hit.score, 4),
+                    "entry_type": payload.get("entry_type", "fix"),
                     "domain": payload.get("domain", ""),
+                    "forbidden_approach": payload.get("forbidden_approach", ""),
                     "symptom": payload.get("symptom", ""),
                     "root_cause": payload.get("root_cause", ""),
                     "verified_fix": payload.get("verified_fix", ""),
@@ -153,19 +209,38 @@ class FixLedger:
             return []
 
     def format_directive(self, matches: List[Dict[str, Any]]) -> str:
-        """Format matching fixes into an authoritative directive block."""
+        """Format matching fixes and dead-ends into authoritative directives."""
         if not matches:
             return ""
 
-        blocks = []
+        fixes = []
+        dead_ends = []
         for m in matches:
             domain = m.get("domain", "GENERAL").upper()
-            blocks.append(
-                f"[VERIFIED PRIOR FIX - {domain}] (Confidence: {m.get('score', 0):.2f})\n"
-                f"- Problem/Symptom: {m.get('symptom')}\n"
-                f"- Root Cause: {m.get('root_cause')}\n"
-                f"- Verified Solution: {m.get('verified_fix')}"
-            )
+            score = m.get("score", 0.0)
+            entry_type = m.get("entry_type", "fix")
+            if entry_type == "dead_end" or m.get("forbidden_approach"):
+                forbidden = m.get("forbidden_approach") or m.get("verified_fix")
+                dead_ends.append(
+                    f"⚠️ [PROVEN DEAD-END - {domain}] (Confidence: {score:.2f})\n"
+                    f"- FORBIDDEN / DO NOT REPEAT: {forbidden}\n"
+                    f"- Failure Symptom: {m.get('symptom')}\n"
+                    f"- Root Cause: {m.get('root_cause')}"
+                )
+            else:
+                fixes.append(
+                    f"[VERIFIED PRIOR FIX - {domain}] (Confidence: {score:.2f})\n"
+                    f"- Problem/Symptom: {m.get('symptom')}\n"
+                    f"- Root Cause: {m.get('root_cause')}\n"
+                    f"- Verified Solution: {m.get('verified_fix')}"
+                )
+
+        blocks = []
+        if dead_ends:
+            blocks.append("### ⚠️ Proven Dead-Ends & Forbidden Anti-Patterns (Do NOT Repeat):\n" + "\n\n".join(dead_ends))
+        if fixes:
+            blocks.append("### Verified Prior Troubleshooting Solutions:\n" + "\n\n".join(fixes))
+
         return "\n\n".join(blocks)
 
     def extract_candidate_fix(
@@ -174,16 +249,17 @@ class FixLedger:
         actions_summary: str,
     ) -> Optional[Dict[str, str]]:
         """
-        Heuristic rule-based check to detect if this turn solved an explicit problem.
-        Matches keywords and patterns without burning unnecessary tokens.
+        Heuristic rule-based check to detect if this turn solved an explicit problem
+        or established an anti-pattern.
         """
         text = f"{user_prompt}\n{actions_summary}"
         
         # Check for error/fix indicators
         has_error = bool(re.search(r"\b(error|failed|exception|traceback|undefined|syntaxerror|bug|issue|broke)\b", text, re.I))
         has_solution = bool(re.search(r"\b(fixed|solved|resolved|solution|root cause|working now|patch|repaired)\b", text, re.I))
+        has_anti_pattern = bool(re.search(r"\b(don't|do not|never|avoid|forbidden|wrong approach|broken approach|dead end|anti-pattern|mistake)\b", text, re.I))
         
-        if not (has_error and has_solution):
+        if not ((has_error and has_solution) or has_anti_pattern):
             return None
 
         # Detect domain
@@ -193,7 +269,18 @@ class FixLedger:
                 domain = candidate
                 break
 
+        if has_anti_pattern:
+            return {
+                "entry_type": "dead_end",
+                "domain": domain,
+                "forbidden_approach": user_prompt.strip(),
+                "symptom": "Repeated failure, syntax error, or behavioral regression",
+                "root_cause": actions_summary.strip()[:300],
+                "verified_fix": f"DO NOT REPEAT: {user_prompt.strip()}",
+            }
+
         return {
+            "entry_type": "fix",
             "domain": domain,
             "symptom": user_prompt.strip(),
             "root_cause": "Identified during turn execution",

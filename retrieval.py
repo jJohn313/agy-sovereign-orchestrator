@@ -447,7 +447,10 @@ class Mem0Retriever:
             return []
 
         try:
-            results = memory.search(query=query, user_id=self.user_id, limit=limit)
+            try:
+                results = memory.search(query=query, filters={"user_id": self.user_id}, limit=limit)
+            except Exception:
+                results = memory.search(query=query, user_id=self.user_id, limit=limit)
             filtered_results: List[Dict[str, Any]] = []
             memories = results.get("results", []) if isinstance(results, dict) else results
 

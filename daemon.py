@@ -160,6 +160,21 @@ class OrchestratorDaemon:
                 logger.error("Daemon record_fix failed: %s", e)
                 return {"status": "error", "message": str(e), "recorded": False}
 
+        elif action == "record_dead_end":
+            domain = req.get("domain", "")
+            forbidden_approach = req.get("forbidden_approach", "")
+            symptom = req.get("symptom", "")
+            root_cause = req.get("root_cause", "")
+            tags = req.get("tags", None)
+            try:
+                from fix_ledger import FixLedger
+                fl = FixLedger()
+                ok = fl.record_dead_end(domain, forbidden_approach, symptom, root_cause, tags=tags)
+                return {"status": "ok", "recorded": ok}
+            except Exception as e:
+                logger.error("Daemon record_dead_end failed: %s", e)
+                return {"status": "error", "message": str(e), "recorded": False}
+
         elif action == "check_idle":
             force_secs = req.get("force_seconds", 601)
             unloaded = self.check_idle(force_seconds=force_secs)
@@ -470,6 +485,38 @@ class DaemonClient:
             return fl.record_fix(domain, symptom, root_cause, verified_fix, tags=tags)
         except Exception as e:
             logger.warning("record_fix fallback failed: %s", e)
+            return False
+
+    def record_dead_end(
+        self,
+        domain: str,
+        forbidden_approach: str,
+        symptom: str,
+        root_cause: str,
+        tags: Optional[List[str]] = None,
+    ) -> bool:
+        """Record proven dead-end via daemon or local fallback."""
+        try:
+            resp = self.send_request({
+                "action": "record_dead_end",
+                "domain": domain,
+                "forbidden_approach": forbidden_approach,
+                "symptom": symptom,
+                "root_cause": root_cause,
+                "tags": tags,
+            })
+            if resp and resp.get("status") == "ok":
+                return resp.get("recorded", False)
+        except Exception:
+            pass
+
+        # In-process fallback
+        try:
+            from fix_ledger import FixLedger
+            fl = FixLedger()
+            return fl.record_dead_end(domain, forbidden_approach, symptom, root_cause, tags=tags)
+        except Exception as e:
+            logger.warning("record_dead_end fallback failed: %s", e)
             return False
 
 

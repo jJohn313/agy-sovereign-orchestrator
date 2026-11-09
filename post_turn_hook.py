@@ -155,6 +155,67 @@ class PostTurnHook:
 
         return False
 
+    def _consolidate_and_commit_memory(self, text: str) -> bool:
+        """
+        Memory Janitor: Deduplicate and supersede existing memories before committing.
+        Checks existing memories with high semantic similarity (>= 0.80).
+        Uses daemon NLI cross-examination:
+        - Contradiction (> 0.70): Supersedes old memory -> delete old memory ID, commit new.
+        - Entailment (> 0.75): Already fully captured -> skip duplicate insertion.
+        - Otherwise: Normal commit.
+        """
+        memory = self._get_memory()
+        if not memory:
+            return self._commit_memory(text)
+
+        try:
+            try:
+                results = memory.search(text, filters={"user_id": self.user_id}, limit=3)
+            except Exception:
+                results = memory.search(text, user_id=self.user_id, limit=3)
+
+            candidates = results.get("results", []) if isinstance(results, dict) else (results or [])
+            high_conf = [c for c in candidates if c.get("score", 0.0) >= 0.80]
+
+            if high_conf:
+                from daemon import DaemonClient
+                client = DaemonClient()
+                for cand in high_conf:
+                    cand_id = cand.get("id")
+                    cand_text = cand.get("memory", "")
+                    if not cand_id or not cand_text:
+                        continue
+
+                    # Evaluate contradiction: does new fact supersede or contradict the candidate?
+                    contra_resp = client.send_request({
+                        "action": "noul",
+                        "state": f"New established invariant: {text}",
+                        "proposition": f"Old recorded fact: {cand_text}. This old fact is now superseded or contradicted."
+                    })
+                    contra_score = float(contra_resp.get("result", 0.0)) if contra_resp else 0.0
+
+                    # Evaluate entailment: is new fact already fully satisfied?
+                    entail_resp = client.send_request({
+                        "action": "noul",
+                        "state": f"Existing verified knowledge: {cand_text}",
+                        "proposition": f"New statement: {text}. This is already completely captured in existing knowledge."
+                    })
+                    entail_score = float(entail_resp.get("result", 0.0)) if entail_resp else 0.0
+
+                    if contra_score > 0.70:
+                        logger.info("Memory Janitor: Contradiction detected (%.2f). Deleting superseded memory [%s]: %s", contra_score, cand_id, cand_text[:60])
+                        try:
+                            memory.delete(cand_id)
+                        except Exception as del_err:
+                            logger.warning("Could not delete superseded memory: %s", del_err)
+                    elif entail_score > 0.75:
+                        logger.info("Memory Janitor: Fact already captured in memory [%s] (entailment=%.2f). Skipping duplicate write.", cand_id, entail_score)
+                        return True
+        except Exception as e:
+            logger.warning("Memory Janitor pass skipped (%s); falling back to direct commit", e)
+
+        return self._commit_memory(text)
+
     def detect_changes_and_reindex(self, cwd: Optional[str] = None) -> Dict[str, Any]:
         """
         Dual-Mode Change Detection (Fix 2 & Hybrid Upgrade):
@@ -396,11 +457,11 @@ class PostTurnHook:
 
         if durable_score > DURABLE_KNOWLEDGE_THRESHOLD:
             memory_text = f"Preference/Rule established in prompt '{user_prompt}': {actions_summary}"
-            committed = self._commit_memory(memory_text)
+            committed = self._consolidate_and_commit_memory(memory_text)
             result["committed"] = committed
             result["memory_text"] = memory_text
 
-        # Episodic Troubleshooting Fix Extraction
+        # Episodic Troubleshooting Fix & Dead-End Extraction
         try:
             from fix_ledger import FixLedger
             fl = FixLedger()
@@ -408,12 +469,20 @@ class PostTurnHook:
             if cand:
                 from daemon import DaemonClient
                 d_client = DaemonClient()
-                recorded = d_client.record_fix(
-                    domain=cand["domain"],
-                    symptom=cand["symptom"],
-                    root_cause=cand["root_cause"],
-                    verified_fix=cand["verified_fix"],
-                )
+                if cand.get("entry_type") == "dead_end":
+                    recorded = d_client.record_dead_end(
+                        domain=cand["domain"],
+                        forbidden_approach=cand.get("forbidden_approach", user_prompt),
+                        symptom=cand.get("symptom", "Repeated failure or regression"),
+                        root_cause=cand.get("root_cause", actions_summary),
+                    )
+                else:
+                    recorded = d_client.record_fix(
+                        domain=cand["domain"],
+                        symptom=cand["symptom"],
+                        root_cause=cand["root_cause"],
+                        verified_fix=cand["verified_fix"],
+                    )
                 result["fix_recorded"] = recorded
         except Exception as e:
             logger.debug("Episodic fix extraction skipped: %s", e)
