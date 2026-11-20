@@ -12,6 +12,7 @@ import os
 import ast
 import re
 import sqlite3
+import subprocess
 import logging
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
@@ -129,11 +130,30 @@ def extract_ast_outline(code: str, target_symbol: Optional[str] = None) -> str:
     return header
 
 
+def extract_git_diff_hunks(cwd: str, rel_path: str, context_lines: int = 15) -> Optional[str]:
+    """Extract unified diff hunks with context for an uncommitted modified file."""
+    try:
+        cmd = ["git", "diff", f"-U{context_lines}", "--", rel_path]
+        res = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=1.5)
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+        cmd_staged = ["git", "diff", "--cached", f"-U{context_lines}", "--", rel_path]
+        res_staged = subprocess.run(cmd_staged, cwd=cwd, capture_output=True, text=True, timeout=1.5)
+        if res_staged.returncode == 0 and res_staged.stdout.strip():
+            return res_staged.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
 def read_file_content_smart(file_path: str, target_symbol: Optional[str] = None, cwd: Optional[str] = None) -> str:
     """
     Context Extraction Strategy:
     - If file is clean in Git: Inject Tree-Sitter interface skeleton / AST outline instead of raw file dump.
-    - If file is dirty/modified locally: Inject full content if <= 300 lines, or AST outline + target symbol if > 300 lines.
+    - If file is dirty/modified locally:
+        * <= 300 lines: Inject full content.
+        * > 300 lines with target_symbol: Inject targeted AST outline + symbol body.
+        * > 300 lines without target_symbol: Diff-anchored hydration (Tree-sitter outline + active diff hunks).
     """
     if not os.path.exists(file_path):
         return f"# Error: File not found: {file_path}"
@@ -177,6 +197,24 @@ def read_file_content_smart(file_path: str, target_symbol: Optional[str] = None,
 
         if len(lines) <= 300:
             return content
+
+        if target_symbol:
+            outline = extract_ast_outline(content, target_symbol=target_symbol)
+            return (
+                f"# File: {rel_path} ({len(lines)} lines - Exceeds 300 lines; targeted symbol view)\n"
+                f"{outline}"
+            )
+
+        # Diff-Anchored Dirty Hydration for large files without target_symbol
+        diff_hunks = extract_git_diff_hunks(str(cwd_path), rel_path)
+        if diff_hunks:
+            outline = extract_ast_outline(content)
+            return (
+                f"# File: {rel_path} ({len(lines)} lines - locally modified; diff-anchored view)\n"
+                f"### High-Level Structural AST Outline:\n{outline}\n\n"
+                f"### Active In-Flight Diff Hunks (context +/- 15 lines):\n"
+                f"```diff\n{diff_hunks}\n```"
+            )
 
         outline = extract_ast_outline(content, target_symbol=target_symbol)
         return (

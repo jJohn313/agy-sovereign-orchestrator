@@ -110,6 +110,25 @@ class TestFrontierCalibration(unittest.TestCase):
                 result_dirty = read_file_content_smart(str(test_file), cwd=tmpdir)
                 self.assertEqual(result_dirty, test_file.read_text())
 
+            # Case C: Dirty file exceeding 300 lines without target_symbol -> diff-anchored hydration
+            large_file = tmp_path / "large.py"
+            large_lines = ["# padding line\n"] * 350
+            large_lines[50] = "def calculate_hash(data: str) -> str:\n    return 'hash'\n"
+            large_file.write_text("".join(large_lines))
+
+            mock_diff = (
+                "@@ -45,15 +45,15 @@\n"
+                "-    return 'old'\n"
+                "+    return 'hash'\n"
+            )
+            with patch("repo_intel_client.RepoIntelClient.get_dirty_files", return_value={"large.py"}), \
+                 patch("retrieval.extract_git_diff_hunks", return_value=mock_diff):
+                result_diff_anchored = read_file_content_smart(str(large_file), cwd=tmpdir)
+                self.assertIn("diff-anchored view", result_diff_anchored)
+                self.assertIn("Active In-Flight Diff Hunks", result_diff_anchored)
+                self.assertIn("+    return 'hash'", result_diff_anchored)
+                self.assertIn("High-Level Structural AST Outline", result_diff_anchored)
+
     def test_daemon_socket_timeout(self):
         # Verify DaemonClient sets 60.0s socket timeout
         client = DaemonClient()
