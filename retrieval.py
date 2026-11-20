@@ -13,6 +13,7 @@ import ast
 import re
 import sqlite3
 import logging
+from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 
@@ -128,20 +129,52 @@ def extract_ast_outline(code: str, target_symbol: Optional[str] = None) -> str:
     return header
 
 
-def read_file_content_smart(file_path: str, target_symbol: Optional[str] = None) -> str:
+def read_file_content_smart(file_path: str, target_symbol: Optional[str] = None, cwd: Optional[str] = None) -> str:
     """
     Context Extraction Strategy:
-    - Files <= 300 lines: Inject full content.
-    - Files > 300 lines: Inject structural outline + full body of target symbol.
+    - If file is clean in Git: Inject Tree-Sitter interface skeleton / AST outline instead of raw file dump.
+    - If file is dirty/modified locally: Inject full content if <= 300 lines, or AST outline + target symbol if > 300 lines.
     """
     if not os.path.exists(file_path):
         return f"# Error: File not found: {file_path}"
 
     try:
+        p = Path(file_path).resolve()
+        cwd_path = Path(cwd or os.getcwd()).resolve()
+        try:
+            rel_path = str(p.relative_to(cwd_path))
+        except Exception:
+            rel_path = p.name
+
+        dirty_files = RepoIntelClient.get_dirty_files(str(cwd_path))
+        is_dirty = rel_path in dirty_files or str(p) in dirty_files or file_path in dirty_files
+
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
 
         lines = content.splitlines()
+
+        if not is_dirty:
+            symbols = RepoIntelClient.extract_file_skeleton_local(p)
+            if symbols:
+                skeleton_lines = [f"# File: {rel_path} ({len(lines)} lines - clean working tree; structural AST skeleton)"]
+                for sym in symbols[:20]:
+                    sig = sym.get("sig", "")
+                    line_no = sym.get("line", "")
+                    skeleton_lines.append(f"  - L{line_no}: {sig}")
+                    methods = sym.get("methods", [])
+                    for m in methods[:6]:
+                        skeleton_lines.append(f"      • {m}")
+                if target_symbol:
+                    body_outline = extract_ast_outline(content, target_symbol=target_symbol)
+                    if "# --- Full Target Symbol Body:" in body_outline:
+                        body_part = body_outline.split("# --- Full Target Symbol Body:", 1)[1]
+                        skeleton_lines.append(f"\n# --- Full Target Symbol Body:{body_part}")
+                return "\n".join(skeleton_lines)
+            else:
+                outline = extract_ast_outline(content, target_symbol=target_symbol)
+                return f"# File: {rel_path} ({len(lines)} lines - clean working tree; structural view)\n{outline}"
+
         if len(lines) <= 300:
             return content
 
@@ -494,12 +527,13 @@ class TargetedVectorRetriever:
         user_prompt: str,
         codebase_gate: float,
         mem0_gate: float,
+        max_k: int = 4,
     ) -> Dict[str, Any]:
         """
         Phase 2: Targeted Vector Retrieval.
         - If Codebase Gate > 0.5: Query Codebase index, filter >= threshold.
         - If Mem0 Gate > 0.5: Query Mem0 vector DB, filter >= threshold.
-        - Applies dynamic Top-K capping (max_k=4) and Semantic Vector MMR deduplication.
+        - Applies dynamic Top-K capping (max_k=4 default, 6-8 for frontier models) and Semantic Vector MMR deduplication.
         """
         context: Dict[str, Any] = {
             "codebase_matches": [],
@@ -551,7 +585,6 @@ class TargetedVectorRetriever:
         candidates.sort(key=lambda x: x["score"], reverse=True)
 
         accepted = []
-        max_k = 4
 
         for cand in candidates:
             if len(accepted) >= max_k:

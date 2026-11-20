@@ -28,7 +28,9 @@ from exec_tool import ExecTool
 logger = logging.getLogger("agy.orchestrator")
 
 JEV_TOOL_MOUNT_THRESHOLD = 0.60
-MAX_ESCALATIONS_PER_TURN = 2
+DEFAULT_MAX_ESCALATIONS = 2
+FRONTIER_MAX_ESCALATIONS = 4
+MAX_ESCALATIONS_PER_TURN = DEFAULT_MAX_ESCALATIONS
 
 # Static invariant system directive for prefix cache locking
 STATIC_SYSTEM_DIRECTIVE = (
@@ -455,10 +457,11 @@ class AgyOrchestrator:
         call_frontier_model: Optional[Callable[..., AgentResponse]] = None,
         execute_tool: Optional[Callable[[ToolCall], str]] = None,
         system_message: Optional[Dict[str, str]] = None,
+        max_escalations: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Phase 3: Frontier Model Execution & Meta-Tool Loop.
-        Enforces maximum 2 escalations per turn (Fix 7).
+        Enforces scalable turn escalations (2 for scout/default, 4 for frontier models).
         """
         if call_frontier_model is None:
             def _dummy_frontier_model(messages, tools, context):
@@ -467,6 +470,8 @@ class AgyOrchestrator:
 
         if execute_tool is None:
             execute_tool = self._default_tool_executor
+
+        escalation_limit = max_escalations if max_escalations is not None else DEFAULT_MAX_ESCALATIONS
 
         messages = []
         if system_message:
@@ -507,15 +512,15 @@ class AgyOrchestrator:
                 if call_obj.name == "enable_capability":
                     cap_name = call_obj.arguments.get("capability")
 
-                    # Hard escalation limit: max 2 per turn
-                    if escalation_count >= MAX_ESCALATIONS_PER_TURN:
-                        logger.warning("Hard escalation limit reached (%d/%d).", escalation_count, MAX_ESCALATIONS_PER_TURN)
+                    # Turn escalation limit: default 2 (Scout) / 4 (Frontier models)
+                    if escalation_count >= escalation_limit:
+                        logger.warning("Hard escalation limit reached (%d/%d).", escalation_count, escalation_limit)
                         messages.append(response.message)
                         messages.append({
                             "role": "tool",
                             "tool_call_id": call_obj.id,
                             "name": "enable_capability",
-                            "content": json.dumps({"error": "Maximum escalation limit (2) reached for this turn."}),
+                            "content": json.dumps({"error": f"Maximum escalation limit ({escalation_limit}) reached for this turn."}),
                         })
                         break
 
@@ -572,6 +577,8 @@ class AgyOrchestrator:
         execute_tool: Optional[Callable[[ToolCall], str]] = None,
         is_summary_flag: bool = False,
         session_id: Optional[str] = None,
+        max_escalations: Optional[int] = None,
+        max_k: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Full 4-Phase Pipeline Execution Lifecycle:
@@ -606,10 +613,23 @@ class AgyOrchestrator:
         codebase_gate = pre_scores.get("needs_codebase_search", 0.0)
         mem0_gate = pre_scores.get("needs_user_memory", 0.0)
 
+        target_model = (os.environ.get("AGY_MODEL") or "").lower()
+        is_frontier = (
+            any(m in target_model for m in ("neon", "hydrogen", "argon", "pro"))
+            or os.environ.get("AGY_MODEL_TIER") == "frontier"
+        )
+        effective_max_k = max_k if max_k is not None else (6 if is_frontier else 4)
+        effective_max_escalations = (
+            max_escalations
+            if max_escalations is not None
+            else (FRONTIER_MAX_ESCALATIONS if is_frontier else DEFAULT_MAX_ESCALATIONS)
+        )
+
         retrieval_context = self.retriever.retrieve(
             user_prompt=user_prompt,
             codebase_gate=codebase_gate,
             mem0_gate=mem0_gate,
+            max_k=effective_max_k,
         )
 
         # Phase 3: Ephemeral Per-Turn Tool Scoping (Fix 6)
@@ -685,6 +705,7 @@ class AgyOrchestrator:
             context=retrieval_context,
             call_frontier_model=call_frontier_model,
             execute_tool=execute_tool,
+            max_escalations=effective_max_escalations,
         )
 
         final_content = loop_result["final_content"]

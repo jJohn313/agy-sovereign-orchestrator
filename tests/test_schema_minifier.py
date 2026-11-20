@@ -147,5 +147,37 @@ class TestSchemaMinifier(unittest.TestCase):
         # Give some leeway for the ~30% requirement depending on the exact string representation
         self.assertGreaterEqual(reduction_percentage, 29.0, "Size reduction should be >= 29%")
 
+    def test_exempt_execution_tools_unpruned(self):
+        edit_file_schema = {
+            "name": "edit_file",
+            "description": "Use this tool to edit an existing file. Follow these rules: 1. Use this tool for a single contiguous block of edits. 2. Target must exactly match existing file text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "Path": {
+                        "type": "string",
+                        "description": "The absolute path of the file to modify. Must exist on filesystem and be readable."
+                    },
+                    "Target": {
+                        "type": "string",
+                        "description": "The exact string to be replaced. This must be the exact character-sequence to be replaced, including whitespace. Be very careful to include any leading whitespace."
+                    },
+                    "Replacement": {
+                        "type": "string",
+                        "description": "The content to replace the target with. Leave empty to delete the target sequence entirely."
+                    }
+                },
+                "required": ["Path", "Target", "Replacement"]
+            }
+        }
+
+        minified = minify_tool_schema(edit_file_schema)
+        # Verify description is NOT truncated to 12 words for exempt execution tool
+        self.assertEqual(minified["description"], edit_file_schema["description"])
+        # Verify property descriptions are NOT truncated
+        props = minified["parameters"]["properties"]
+        self.assertEqual(props["Target"]["description"], edit_file_schema["parameters"]["properties"]["Target"]["description"])
+        self.assertEqual(props["Path"]["description"], edit_file_schema["parameters"]["properties"]["Path"]["description"])
+
 if __name__ == "__main__":
     unittest.main()

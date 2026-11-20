@@ -247,7 +247,7 @@ class OrchestratorDaemon:
 
                 client_sock, _ = self.server_socket.accept()
                 with client_sock:
-                    client_sock.settimeout(5.0)
+                    client_sock.settimeout(60.0)
                     data = client_sock.recv(65536)
                     if not data:
                         continue
@@ -414,7 +414,7 @@ class DaemonClient:
         self.ensure_daemon()
 
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(15.0)
+        sock.settimeout(60.0)
         try:
             sock.connect(self.socket_path)
             sock.sendall(json.dumps(payload).encode("utf-8"))
