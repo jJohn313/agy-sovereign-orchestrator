@@ -663,8 +663,11 @@ class AgyOrchestrator:
         turn_prompt = f"{user_prompt}\n{mode_directive}" if mode_directive else user_prompt
 
         pre_resolved_scope = retrieval_context.get("pre_resolved_scope", "")
+        repo_intel_overview = retrieval_context.get("repo_intel_overview", "")
         if pre_resolved_scope:
             turn_prompt = f"{pre_resolved_scope}\n\n{turn_prompt}"
+        elif repo_intel_overview:
+            turn_prompt = f"{repo_intel_overview}\n\n{turn_prompt}"
 
         # 1. Prepare L4a (Static Invariants from Registry)
         l4a_static = {

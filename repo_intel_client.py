@@ -76,7 +76,10 @@ class RepoIntelClient:
                 mtime = local_cache_file.stat().st_mtime
                 if time.time() - mtime < CACHE_TTL_SEC:
                     with open(local_cache_file, "r", encoding="utf-8") as f:
-                        return json.load(f)
+                        cached = json.load(f)
+                    if isinstance(cached, dict) and "files" in cached:
+                        return cached
+                    local_cache_file.unlink(missing_ok=True)
             except Exception as e:
                 logger.debug("Failed to read local skeleton cache: %s", e)
 
@@ -86,6 +89,8 @@ class RepoIntelClient:
             req = urllib.request.Request(url, headers={"User-Agent": "Agy-Orchestrator-Intel/1.0"})
             with urllib.request.urlopen(req, timeout=0.8) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+                if not isinstance(data, dict) or "files" not in data:
+                    return None
                 (CACHE_DIR / repo_name).mkdir(parents=True, exist_ok=True)
                 with open(local_cache_file, "w", encoding="utf-8") as f:
                     json.dump(data, f)
@@ -95,6 +100,20 @@ class RepoIntelClient:
             pass
 
         return None
+
+    @classmethod
+    def format_repo_overview(cls, cwd: str) -> str:
+        """Returns a compact 1-line God-Node orientation header when Moonveil/cached intel exists."""
+        repo_name = cls.get_repo_name(cwd)
+        if not repo_name or repo_name == "unknown":
+            return ""
+        skeleton_data = cls.fetch_skeleton(repo_name)
+        if not skeleton_data:
+            return ""
+        god_nodes = skeleton_data.get("god_nodes", [])
+        if not god_nodes:
+            return ""
+        return f"Repository: `{repo_name}` | Core God-Nodes: {', '.join(f'`{g}`' for g in god_nodes[:5])}"
 
     @classmethod
     def extract_file_skeleton_local(cls, file_path: Path) -> List[Dict[str, Any]]:

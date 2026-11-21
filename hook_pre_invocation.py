@@ -105,6 +105,7 @@ def main():
 
         retrieval_text = ""
         pre_scope_text = ""
+        repo_overview_text = ""
         if cb_gate > 0.5 or mem_gate > 0.5:
             try:
                 retriever = TargetedVectorRetriever()
@@ -115,8 +116,11 @@ def main():
                 )
                 formatted = ret_ctx.get("formatted_context", "")
                 pre_scope = ret_ctx.get("pre_resolved_scope", "")
+                repo_overview = ret_ctx.get("repo_intel_overview", "")
                 if pre_scope:
                     pre_scope_text = pre_scope
+                elif repo_overview:
+                    repo_overview_text = repo_overview
                 if formatted and formatted != pre_scope:
                     retrieval_text = f"### Retrieved Codebase References & Directives:\n{formatted}"
             except Exception as e:
@@ -132,6 +136,8 @@ def main():
 
         if pre_scope_text:
             directive_parts.append(pre_scope_text)
+        elif repo_overview_text:
+            directive_parts.append(repo_overview_text)
         if retrieval_text:
             directive_parts.append(retrieval_text)
 

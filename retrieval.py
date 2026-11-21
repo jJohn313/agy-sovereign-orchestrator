@@ -578,6 +578,7 @@ class TargetedVectorRetriever:
             "mem0_matches": [],
             "formatted_context": "",
             "pre_resolved_scope": "",
+            "repo_intel_overview": "",
         }
 
         candidates = []
@@ -692,5 +693,7 @@ class TargetedVectorRetriever:
         context["formatted_context"] = "\n".join(lines)
         context["codebase_matches"] = [item["raw"] for item in accepted if item["source"] == "codebase"]
         context["mem0_matches"] = [item["raw"] for item in accepted if item["source"] == "mem0"]
+        if codebase_gate > 0.5 and context["codebase_matches"]:
+            context["repo_intel_overview"] = RepoIntelClient.format_repo_overview(os.getcwd())
 
         return context

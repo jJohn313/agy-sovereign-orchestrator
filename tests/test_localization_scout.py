@@ -32,6 +32,7 @@ class TestLocalizationScout(unittest.TestCase):
         self.assertIn("src/valid.py", context["formatted_context"])
         self.assertEqual(context.get("pre_resolved_scope", ""), "")
 
+    @patch("repo_intel_client.RepoIntelClient.fetch_skeleton", return_value=None)
     @patch("retrieval.CodebaseRetriever.search")
     @patch("retrieval.Mem0Retriever.search")
     @patch("ephemeral_scout.EphemeralScout.is_available")
@@ -39,7 +40,7 @@ class TestLocalizationScout(unittest.TestCase):
     @patch("ephemeral_scout.EphemeralScout._generate_candidates")
     @patch("os.path.exists")
     def test_mock_low_confidence_vector_miss_active_slm(
-        self, mock_exists, mock_generate_candidates, mock_urlopen, mock_is_available, mock_mem0, mock_cb
+        self, mock_exists, mock_generate_candidates, mock_urlopen, mock_is_available, mock_mem0, mock_cb, _mock_fetch
     ):
         # Codebase search internally filters out scores < 0.75, so it returns empty
         mock_cb.return_value = []
@@ -49,7 +50,7 @@ class TestLocalizationScout(unittest.TestCase):
 
         # We need mock_exists to return True for valid paths and False for hallucinated
         def exists_side_effect(path):
-            return path.endswith("src/valid.py")
+            return str(path).endswith("src/valid.py")
         mock_exists.side_effect = exists_side_effect
 
         mock_generate_candidates.return_value = ["src/valid.py", "src/other.py"]
